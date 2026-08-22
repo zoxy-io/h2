@@ -16,16 +16,19 @@ zoxy-io/zoxy#173 and zoxy-io/zrk#21.
 
 ## Gates — run before every commit
 
-- `zig build ci` — unit tests, the lint's own tests, the fuzz corpus, and the
-  boundary lint.
+- `zig build ci` — the format check, unit tests, the lint's own tests, the fuzz
+  corpus, and the boundary lint. This is exactly what CI runs, on each target
+  natively.
 - `zig build bench` — the performance gate. **Not optional for a change that
   touches a decode or encode path.** Compare bands across runs, never single
   numbers: a 3% move between two runs on a laptop is noise, and reporting it as
   a regression trains everyone to ignore the gate. Say which numbers moved and
   by how much in the commit message when they move at all.
-- `zig fmt --check src scripts bench build.zig build.zig.zon` — the format
-  gate. A PostToolUse hook auto-formats files as they are edited, so this
-  should never fail; if it does, something wrote a file outside the tools.
+- The format gate is part of `zig build ci`, and `zig build fmt-fix` rewrites.
+  The list of formatted paths lives in build.zig and nowhere else, so CI cannot
+  check a different set than you do. A PostToolUse hook auto-formats files as
+  they are edited, so the gate should never fail; if it does, something wrote a
+  file outside the tools.
 
 ## Review — required before every commit
 

@@ -1,0 +1,30 @@
+name: test-aarch64-linux
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    strategy:
+      # Every target is exercised even when one fails, so a
+      # platform-specific break is not masked by a faster one.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm]
+        target: [aarch64-linux-gnu, aarch64-linux-musl]
+    runs-on: ${{ matrix.os }}
+    name: Test ${{ matrix.os }}, ${{ matrix.target }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # `ci` is fmt + test + lint. Running the whole step rather than
+      # `zig build test` keeps CI and a local check from checking different
+      # things — the reason the gates are build steps at all.
+      - name: Gates
+        run: zig build ci -Dtarget=${{ matrix.target }}
+

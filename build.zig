@@ -100,12 +100,25 @@ pub fn build(b: *std.Build) void {
     // A corpus replayed only under `zig build fuzz` is a corpus that rots.
     test_step.dependOn(&fuzz_run.step);
 
+    // The format gate. A build step rather than a documented `zig fmt --check`
+    // incantation, so that the list of formatted paths lives in exactly one
+    // place and CI cannot check a different set than a developer does.
+    const fmt_paths = &.{ "src", "scripts", "bench", "fuzz", "build.zig", "build.zig.zon" };
+    const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
+    const fmt_step = b.step("fmt", "Check formatting (zig build fmt-fix rewrites)");
+    fmt_step.dependOn(&fmt_check.step);
+
+    const fmt_fix = b.addFmt(.{ .paths = fmt_paths });
+    const fmt_fix_step = b.step("fmt-fix", "Reformat in place");
+    fmt_fix_step.dependOn(&fmt_fix.step);
+
     // Every per-change gate behind one name, so CI and a local check cannot
     // drift apart. `bench` is deliberately excluded: its verdict is a band
     // comparison a human makes across runs, not a pass/fail a shared runner
     // can produce. CLAUDE.md requires it by hand for a change that touches a
     // decode or encode path.
-    const ci_step = b.step("ci", "Per-change gates: test + lint (bench is run by hand)");
+    const ci_step = b.step("ci", "Per-change gates: fmt + test + lint (bench is run by hand)");
+    ci_step.dependOn(fmt_step);
     ci_step.dependOn(test_step);
     ci_step.dependOn(lint_step);
 }

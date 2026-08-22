@@ -1,6 +1,10 @@
 # h2
 
 ![GitHub License](https://img.shields.io/github/license/zoxy-io/h2?color=orange)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/zoxy-io/h2/test-x86_64-linux.yml?label=x86_64-linux)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/zoxy-io/h2/test-aarch64-linux.yml?label=aarch64-linux)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/zoxy-io/h2/test-x86_64-windows.yml?label=x86_64-windows)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/zoxy-io/h2/test-macos.yml?label=macos)
 
 HTTP/2 frame codec and HPACK.
 
@@ -34,10 +38,14 @@ header fields out: a reader or writer in the seam would exclude one of them.
 ## Gates
 
 ```sh
-zig build ci      # tests, the lint's own tests, the fuzz corpus, the boundary lint
+zig build ci      # format check, tests, the fuzz corpus, the boundary lint
 zig build bench   # decode/encode microbenchmarks (ReleaseFast)
 zig build fuzz    # replay the corpus; --fuzz to actually fuzz
+zig build fmt-fix # reformat in place
 ```
+
+CI runs `zig build ci` natively on each target, so the tests run rather than
+merely cross-compile.
 
 ## Style
 

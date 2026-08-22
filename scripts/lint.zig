@@ -127,7 +127,8 @@ pub fn main(init: std.process.Init) !u8 {
         }
         file_count += 1;
         assert(file_count <= files_max);
-        violation_count += try lintFile(arena, io, root, entry.path);
+        const path = try normalizeSeparators(arena, entry.path);
+        violation_count += try lintFile(arena, io, root, entry.path, path);
     }
     assert(file_count >= 1);
 
@@ -138,14 +139,19 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
+/// `walked_path` is what the walker handed back and what opens the file;
+/// `path` is the same path with '/' separators, which is what the rules and
+/// their messages speak. On a '/' host they are the same bytes.
 fn lintFile(
     arena: std.mem.Allocator,
     io: std.Io,
     root: std.Io.Dir,
+    walked_path: []const u8,
     path: []const u8,
 ) !u32 {
-    assert(path.len > 0);
-    const contents = try root.readFileAlloc(io, path, arena, .limited(file_bytes_max));
+    assert(walked_path.len > 0);
+    assert(path.len == walked_path.len);
+    const contents = try root.readFileAlloc(io, walked_path, arena, .limited(file_bytes_max));
     assert(contents.len < file_bytes_max);
 
     var violation_count: u32 = 0;
@@ -309,14 +315,20 @@ fn lineIsComment(line: []const u8) bool {
     return std.mem.startsWith(u8, trimmed, "//");
 }
 
-comptime {
-    // Every path here — the walked one and the confinements above — is
-    // compared byte-for-byte with '/' as the separator. Unlike zoxy, this
-    // package does support Windows (hparse's CI proves the same for a sibling
-    // parser), so if a '\\' host ever runs the lint this assertion is the
-    // thing that says it needs real path handling rather than silently
-    // passing every boundary.
-    assert(std.fs.path.sep == '/');
+/// Rewrite '\\' to '/' so the rules can be written one way.
+///
+/// zoxy's original asserts `std.fs.path.sep == '/'` at comptime instead,
+/// which is right for a Linux-only proxy and wrong here: this package is
+/// cross-platform, its CI runs on Windows, and a lint that refuses to compile
+/// there is a lint that does not run on a third of the matrix. Normalizing is
+/// cheap and the confinements stay written with '/'.
+fn normalizeSeparators(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    assert(path.len > 0);
+    if (std.mem.indexOfScalar(u8, path, '\\') == null) return path;
+    const normalized = try arena.dupe(u8, path);
+    std.mem.replaceScalar(u8, normalized, '\\', '/');
+    assert(normalized.len == path.len);
+    return normalized;
 }
 
 /// True when `path` is the file named by `confinement`, or lies under it as a
@@ -468,6 +480,15 @@ test "lintUnboundedLoops: each unbounded loop in a file is counted" {
         \\
     ;
     try std.testing.expectEqual(@as(u32, 2), countUnboundedLoops(source));
+}
+
+test "normalizeSeparators: a Windows path is rewritten, a POSIX one is not" {
+    const arena = std.testing.allocator;
+    const posix = try normalizeSeparators(arena, "hpack/Decoder.zig");
+    try std.testing.expectEqualStrings("hpack/Decoder.zig", posix);
+    const windows = try normalizeSeparators(arena, "hpack\\Decoder.zig");
+    defer arena.free(windows);
+    try std.testing.expectEqualStrings("hpack/Decoder.zig", windows);
 }
 
 test "pathIsUnder: exact files, directory prefixes, and near misses" {
