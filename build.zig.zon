@@ -7,6 +7,9 @@
     // `scripts/lint.zig` forbids `@cImport`, and every buffer is caller-owned,
     // so there is nothing left for a dependency to provide.
     .dependencies = .{},
+    // What ships to a consumer. `corpus/`, `fuzz/`, `bench/` and `scripts/`
+    // are gates rather than library, and `corpus/` alone is 828 KiB of
+    // vendored fixtures nobody depending on this package needs.
     .paths = .{
         "build.zig",
         "build.zig.zon",

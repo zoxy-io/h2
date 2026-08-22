@@ -38,9 +38,10 @@ header fields out: a reader or writer in the seam would exclude one of them.
 ## Gates
 
 ```sh
-zig build ci      # format check, tests, the fuzz corpus, the boundary lint
+zig build ci      # format check, tests, fuzz corpus, interop corpus, boundary lint
 zig build bench   # decode/encode microbenchmarks (ReleaseFast)
-zig build fuzz    # replay the corpus; --fuzz to actually fuzz
+zig build fuzz    # replay the fuzz corpus; --fuzz to actually fuzz
+zig build corpus  # interoperability conformance against other implementations
 zig build fmt-fix # reformat in place
 ```
 
