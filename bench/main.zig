@@ -48,6 +48,7 @@ const workloads = [_]Workload{
     .{ .name = "frame header", .run = benchFrameHeader },
     .{ .name = "frame parse", .run = benchFrameParse },
     .{ .name = "frame render", .run = benchFrameRender },
+    .{ .name = "block assembly", .run = benchBlockAssembly },
     .{ .name = "hpack decode", .run = benchHpackDecode },
     .{ .name = "hpack encode", .run = benchHpackEncode },
     .{ .name = "hpack encode static", .run = benchHpackEncodeStatic },
@@ -179,6 +180,46 @@ fn benchFrameRender(iterations: u64) u64 {
     }
     return checksum;
 }
+
+/// Assemble a field block that spans four CONTINUATION frames.
+///
+/// The shape a large request header set actually arrives in, and the one the
+/// contiguity rules of section 4.3 exist for. Measured against `frame parse`,
+/// the difference is what reassembly costs on top of reading the frames.
+fn benchBlockAssembly(iterations: u64) u64 {
+    assert(iterations >= 1);
+    var checksum: u64 = 0;
+    var index: u64 = 0;
+    while (index < iterations) : (index += 1) {
+        var assembly: [4096]u8 = undefined;
+        var assembler = h2.frame.BlockAssembler.init(
+            &assembly,
+            h2.frame.BlockAssembler.frames_max_default,
+        );
+        for (block_frames) |wire| {
+            const header = h2.frame.Header.parse(wire) catch unreachable;
+            const body = wire[h2.frame.Header.octets..][0..header.length];
+            const parsed = h2.frame.payload.parse(header, body) catch unreachable;
+            const accepted = assembler.accept(header, &parsed) catch unreachable;
+            checksum +%= switch (accepted) {
+                .block => |assembled| assembled.fragment.len,
+                else => 1,
+            };
+            std.mem.doNotOptimizeAway(checksum);
+        }
+    }
+    return checksum;
+}
+
+/// One field block across five frames: a HEADERS that does not end it, three
+/// CONTINUATIONs, and a last one that does.
+const block_frames = [_][]const u8{
+    "\x00\x00\x0d\x01\x00\x00\x00\x00\x01" ++ "this is dummy",
+    "\x00\x00\x0d\x09\x00\x00\x00\x00\x01" ++ "this is dummy",
+    "\x00\x00\x0d\x09\x00\x00\x00\x00\x01" ++ "this is dummy",
+    "\x00\x00\x0d\x09\x00\x00\x00\x00\x01" ++ "this is dummy",
+    "\x00\x00\x0d\x09\x04\x00\x00\x00\x01" ++ "this is dummy",
+};
 
 /// Whole frames, header and payload, of the shapes a connection carries.
 ///

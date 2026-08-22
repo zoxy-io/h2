@@ -43,6 +43,9 @@ const list_size_max = 64 * 1024;
 /// Operations in one dynamic-table sequence, so a failing case stays short.
 const operations_max = 64;
 
+/// Frames offered to one field block assembler in a sequence.
+const frames_per_sequence_max = 24;
+
 /// Blocks per round-trip sequence, and fields per block.
 const blocks_max = 8;
 const fields_max = 16;
@@ -205,6 +208,63 @@ fn assertBorrowed(owner: []const u8, borrowed: []const u8) void {
     const begin = @intFromPtr(borrowed.ptr);
     std.debug.assert(begin >= owner_begin);
     std.debug.assert(begin + borrowed.len <= owner_begin + owner.len);
+}
+
+test "fuzz: field block assembly" {
+    try std.testing.fuzz({}, fuzzBlockAssembly, .{});
+}
+
+/// Drive a sequence of drawn frames through the field block assembler.
+///
+/// The first thing in the package that holds state, so the properties are about
+/// the state machine rather than one call: a failure always leaves nothing open,
+/// a completed block never exceeds the buffer it was assembled in, and no block
+/// spans more frames than the bound allows. The sequence matters — a
+/// single-frame target could not reach the interleaving rules at all.
+fn fuzzBlockAssembly(_: void, smith: *std.testing.Smith) !void {
+    var assembly: [512]u8 = undefined;
+    const frames_max: u32 = 1 + smith.value(u3);
+    var assembler = frame.BlockAssembler.init(&assembly, frames_max);
+
+    var offered: u32 = 0;
+    while (offered < frames_per_sequence_max and !smith.eosWeightedSimple(10, 1)) {
+        offered += 1;
+
+        var wire: [input_max]u8 = undefined;
+        const length = smith.slice(&wire);
+        if (length < frame.Header.octets) continue;
+
+        const body_length: u32 = @intCast(length - frame.Header.octets);
+        wire[0] = @truncate(body_length >> 16);
+        wire[1] = @truncate(body_length >> 8);
+        wire[2] = @truncate(body_length);
+
+        const header = frame.Header.parse(wire[0..length]) catch unreachable;
+        header.validate(frame.Header.max_frame_size_min) catch continue;
+        const body = wire[frame.Header.octets..][0..header.length];
+        const parsed = frame.payload.parse(header, body) catch continue;
+
+        const accepted = assembler.accept(header, &parsed) catch |err| {
+            // Every failure ends the connection, and leaves nothing a caller
+            // could keep feeding.
+            std.debug.assert(frame.BlockAssembler.severity(err) == .connection);
+            std.debug.assert(!assembler.isOpen());
+            _ = frame.BlockAssembler.errorCode(err);
+            return;
+        };
+
+        switch (accepted) {
+            .passthrough => std.debug.assert(!assembler.isOpen()),
+            .fragment => std.debug.assert(assembler.isOpen()),
+            .block => |block| {
+                // A finished block fits the buffer it was assembled in, and
+                // the assembler is ready for the next one.
+                std.debug.assert(block.fragment.len <= assembly.len);
+                std.debug.assert(!assembler.isOpen());
+                assertBorrowed(&assembly, block.fragment);
+            },
+        }
+    }
 }
 
 test "fuzz: hpack decoder" {

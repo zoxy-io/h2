@@ -10,6 +10,7 @@
 
 const std = @import("std");
 
+pub const BlockAssembler = @import("frame/BlockAssembler.zig");
 pub const Header = @import("frame/Header.zig");
 pub const payload = @import("frame/payload.zig");
 pub const Payload = payload.Payload;
@@ -19,6 +20,7 @@ pub const ErrorCode = Header.ErrorCode;
 pub const Severity = Header.Severity;
 
 test {
+    _ = BlockAssembler;
     _ = Header;
     _ = payload;
 }
