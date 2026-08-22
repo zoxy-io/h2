@@ -2,11 +2,7 @@
 
 ![GitHub License](https://img.shields.io/github/license/zoxy-io/h2?color=orange)
 
-HTTP/2 frame codec and HPACK. Powered by Zig ⚡
-
-**Pre-alpha — nothing is implemented yet.** This repository exists so the two
-pieces of HTTP/2 that are pure — no I/O, no protocol state — get written once
-and used twice.
+HTTP/2 frame codec and HPACK.
 
 ## Scope
 
