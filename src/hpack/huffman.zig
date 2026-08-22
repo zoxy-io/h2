@@ -46,16 +46,31 @@ pub const bits_max = table.bits_max;
 /// decoding error".
 const padding_bits_max: u8 = 7;
 
+comptime {
+    // Padding shorter than an octet is the whole of section 5.2's second rule.
+    assert(padding_bits_max < 8);
+    // One symbol per nibble, which is what lets a `Transition` hold a single
+    // symbol and what `walkNibble` asserts dynamically. Four bits cannot finish
+    // two codes unless the shortest is four or fewer.
+    assert(bits_min > 4);
+    // A complete prefix code over `eos + 1` symbols has that many leaves and
+    // one fewer internal node.
+    assert(nodes_max == 2 * (@as(u16, eos) + 1) - 1);
+    // Every state is an internal node, plus one for failure. A full binary
+    // tree with L leaves has L - 1 internal nodes, so 2L - 1 total.
+    assert(states_max == @divExact(nodes_max - 1, 2) + 1);
+}
+
 /// One nibble's transition. Four octets, so a row is 64 and the whole table is
 /// `states_count` times that.
 const Transition = struct {
-    next: u16,
+    next_state: u16,
     symbol: u8,
     emits: bool,
 
     /// A transition that goes nowhere and emits nothing, used to fill the
     /// table before the walk overwrites it.
-    const blank: Transition = .{ .next = 0, .symbol = 0, .emits = false };
+    const blank: Transition = .{ .next_state = 0, .symbol = 0, .emits = false };
 };
 
 /// The code is a complete prefix code over 257 symbols, so its tree has 257
@@ -92,12 +107,19 @@ fn buildTree() Tree {
     tree.all_ones[0] = true;
 
     for (table.codes, 0..) |code, symbol| {
+        assert(code.bits >= table.bits_min);
+        assert(code.bits <= table.bits_max);
         var node: u16 = 0;
         var index: u5 = 0;
         while (index < code.bits) : (index += 1) {
+            // Descending through a leaf would mean this code has another code
+            // as its prefix. Half of prefix-freeness, asserted where it would
+            // happen rather than inferred from the node count afterwards.
+            assert(!tree.is_leaf[node]);
             const bit: u1 = @truncate(code.code >> (code.bits - 1 - index));
             if (tree.child[node][bit] == node_none) {
                 const fresh = tree.count;
+                assert(fresh < nodes_max);
                 tree.count += 1;
                 tree.child[node][bit] = fresh;
                 tree.depth[fresh] = tree.depth[node] + 1;
@@ -105,10 +127,58 @@ fn buildTree() Tree {
             }
             node = tree.child[node][bit];
         }
+        // And the other half: a code cannot land on an interior node, which
+        // would mean some other code is a prefix of *it*.
+        assert(!tree.is_leaf[node]);
+        assert(tree.child[node][0] == node_none);
+        assert(tree.child[node][1] == node_none);
         tree.is_leaf[node] = true;
         tree.symbol[node] = @intCast(symbol);
     }
+    assert(tree.count == nodes_max);
     return tree;
+}
+
+/// The result of walking one nibble from a state: where it lands, and the at
+/// most one symbol it completes on the way.
+const NibbleWalk = struct {
+    node: u16,
+    symbol: u8,
+    emits: bool,
+    failed: bool,
+};
+
+/// Walk four bits from `origin`.
+///
+/// At most one symbol can complete: the shortest code is five bits, so after
+/// emitting, the walk restarts at the root with three bits left at most. That
+/// is a comptime relation above and an assertion here.
+fn walkNibble(tree: *const Tree, origin: u16, nibble: u4) NibbleWalk {
+    var node = origin;
+    var symbol: u8 = 0;
+    var emits = false;
+
+    var step: u3 = 0;
+    while (step < 4) : (step += 1) {
+        const shift: u2 = @intCast(3 - step);
+        const bit: u1 = @truncate(nibble >> shift);
+        node = tree.child[node][bit];
+        // The tree is complete, so descent always lands somewhere.
+        assert(node != node_none);
+        if (tree.is_leaf[node]) {
+            if (tree.symbol[node] == eos) {
+                // An encoded string containing EOS is a decoding error (RFC
+                // 7541 section 5.2), not a string terminator.
+                return .{ .node = 0, .symbol = 0, .emits = false, .failed = true };
+            }
+            assert(!emits);
+            emits = true;
+            symbol = @intCast(tree.symbol[node]);
+            node = 0;
+        }
+    }
+    assert(step == 4);
+    return .{ .node = node, .symbol = symbol, .emits = emits, .failed = false };
 }
 
 const Machine = struct {
@@ -136,61 +206,39 @@ fn buildMachine() Machine {
     while (state < built.count) : (state += 1) {
         const origin = node_of_state[state];
         for (0..16) |nibble| {
-            var node = origin;
-            var symbol: u8 = 0;
-            var emits = false;
-            var failed = false;
-
-            var step: u2 = 0;
-            while (true) : (step += 1) {
-                assert(step < 4);
-                const bit: u1 = @truncate(nibble >> (3 - step));
-                node = tree.child[node][bit];
-                // The tree is complete, so descent always lands somewhere.
-                assert(node != node_none);
-                if (tree.is_leaf[node]) {
-                    if (tree.symbol[node] == eos) {
-                        // An encoded string containing EOS is a decoding error
-                        // (RFC 7541 section 5.2), not a string terminator.
-                        failed = true;
-                        break;
-                    }
-                    // Four bits cannot finish two codes: the shortest is five,
-                    // so after emitting we restart at the root with at most
-                    // three bits left.
-                    assert(!emits);
-                    emits = true;
-                    symbol = @intCast(tree.symbol[node]);
-                    node = 0;
-                }
-                if (step == 3) break;
-            }
-
-            if (failed) {
+            const walk = walkNibble(&tree, origin, @intCast(nibble));
+            if (walk.failed) {
                 // Patched to the failure state below, once its index is known.
-                built.transitions[state][nibble] = .{ .next = node_none, .symbol = 0, .emits = false };
+                built.transitions[state][nibble] = .{ .next_state = node_none, .symbol = 0, .emits = false };
                 continue;
             }
-            if (state_of_node[node] == node_none) {
+            if (state_of_node[walk.node] == node_none) {
                 const fresh = built.count;
                 built.count += 1;
                 assert(built.count <= states_max);
-                state_of_node[node] = fresh;
-                node_of_state[fresh] = node;
+                state_of_node[walk.node] = fresh;
+                node_of_state[fresh] = walk.node;
             }
             built.transitions[state][nibble] = .{
-                .next = state_of_node[node],
-                .symbol = symbol,
-                .emits = emits,
+                .next_state = state_of_node[walk.node],
+                .symbol = walk.symbol,
+                .emits = walk.emits,
             };
         }
     }
 
+    finish(&built, &tree, &node_of_state);
+    return built;
+}
+
+/// Point every failed transition at the failure state, and precompute which
+/// states a valid encoding may end in.
+fn finish(built: *Machine, tree: *const Tree, node_of_state: *const [states_max]u16) void {
     const failure = built.count;
     assert(failure < states_max);
     for (0..failure) |index| {
         for (&built.transitions[index]) |*transition| {
-            if (transition.next == node_none) transition.next = failure;
+            if (transition.next_state == node_none) transition.next_state = failure;
         }
         const node = node_of_state[index];
         // Section 5.2's two padding rules, precomputed: the leftover bits must
@@ -201,10 +249,10 @@ fn buildMachine() Machine {
     // Absorbing, and never accepting, so failure needs no branch to detect and
     // cannot be undone by later input.
     for (&built.transitions[failure]) |*transition| {
-        transition.* = .{ .next = failure, .symbol = 0, .emits = false };
+        transition.* = .{ .next_state = failure, .symbol = 0, .emits = false };
     }
     built.accepting[failure] = false;
-    return built;
+    assert(!built.accepting[failure]);
 }
 
 const machine = blk: {
@@ -222,6 +270,11 @@ const accepting = machine.accepting;
 pub const DecodeError = error{
     /// The encoding contains EOS, ends mid-code, or pads with something other
     /// than fewer than eight one-bits.
+    ///
+    /// `target` may hold a partial decoding when this is returned — the failure
+    /// is only detectable at the end of the input, by which time whatever was
+    /// valid has already been written. Callers treat the whole string as absent
+    /// rather than truncated.
     Invalid,
     /// The decoding does not fit `target`. For a header field this is the
     /// compression-bomb bound, and the caller sized it.
@@ -237,30 +290,34 @@ pub const DecodeError = error{
 /// and keeps the hot path to two lookups and two predictable branches per
 /// octet.
 pub fn decode(target: []u8, source: []const u8) DecodeError!u32 {
+    // `written` is a u32, which is a precondition rather than an assumption.
+    assert(target.len <= std.math.maxInt(u32));
     var state: u16 = 0;
     var written: u32 = 0;
 
     for (source) |octet| {
-        const high = transitions[state][octet >> 4];
+        // Narrowed so the row index is a type property rather than a bounds
+        // check the optimizer has to rediscover, in the one loop this file's
+        // whole design argument is about.
+        const high = transitions[state][@as(u4, @truncate(octet >> 4))];
         if (high.emits) {
             if (written == target.len) return error.OutputTooLong;
             target[written] = high.symbol;
             written += 1;
         }
-        state = high.next;
+        state = high.next_state;
 
-        const low = transitions[state][octet & 0x0f];
+        const low = transitions[state][@as(u4, @truncate(octet))];
         if (low.emits) {
             if (written == target.len) return error.OutputTooLong;
             target[written] = low.symbol;
             written += 1;
         }
-        state = low.next;
+        state = low.next_state;
     }
 
     assert(state < states_max);
     if (!accepting[state]) return error.Invalid;
-    assert(written <= target.len);
     return written;
 }
 
@@ -268,8 +325,8 @@ pub fn decode(target: []u8, source: []const u8) DecodeError!u32 {
 pub fn encodedLength(source: []const u8) u64 {
     var bits: u64 = 0;
     for (source) |octet| bits += table.codes[octet].bits;
-    assert(bits <= @as(u64, source.len) * bits_max);
-    return (bits + 7) / 8;
+    assert(bits >= @as(u64, source.len) * bits_min);
+    return std.math.divCeil(u64, bits, 8) catch unreachable;
 }
 
 pub const EncodeError = error{
@@ -283,6 +340,7 @@ pub fn encode(target: []u8, source: []const u8) EncodeError!u32 {
     // Holding fewer than eight bits before each symbol and adding at most
     // thirty keeps the accumulator under thirty-eight bits, so it never
     // overflows and the flush never has to check.
+    const length = encodedLength(source);
     var accumulator: u64 = 0;
     var bits: u6 = 0;
     var written: u32 = 0;
@@ -292,9 +350,16 @@ pub fn encode(target: []u8, source: []const u8) EncodeError!u32 {
         assert(bits < 8);
         accumulator = (accumulator << code.bits) | code.code;
         bits += code.bits;
-        assert(bits <= 38); // 7 carried in, plus the longest code.
+        // Seven carried in plus the longest code. Asserting the proof rather
+        // than a round number above it.
+        assert(bits <= 7 + @as(u6, bits_max));
         while (bits >= 8) {
             bits -= 8;
+            // The up-front length check is all that stands between a
+            // length/emit disagreement and a write past the end, so the
+            // negative space belongs here rather than only in the postcondition
+            // that would notice afterwards.
+            assert(written < length);
             target[written] = @truncate(accumulator >> bits);
             written += 1;
         }
@@ -305,11 +370,12 @@ pub fn encode(target: []u8, source: []const u8) EncodeError!u32 {
         const padding: u6 = 8 - bits;
         // Pad with the most significant bits of EOS, which are ones.
         const ones: u64 = (@as(u64, 1) << padding) - 1;
+        assert(written < length);
         target[written] = @truncate((accumulator << padding) | ones);
         written += 1;
     }
 
-    assert(written == encodedLength(source));
+    assert(written == length);
     return written;
 }
 

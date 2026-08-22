@@ -40,7 +40,7 @@ never_indexed: bool = false,
 ///
 /// Returns `u64` because it is summed over a whole header block, and a bound
 /// that can overflow before it is compared is not a bound.
-pub fn size(field: Field) u64 {
+pub fn size(field: *const Field) u64 {
     assert(field.name.len <= std.math.maxInt(u32));
     assert(field.value.len <= std.math.maxInt(u32));
     return @as(u64, field.name.len) + @as(u64, field.value.len) + overhead;
@@ -56,7 +56,7 @@ pub fn size(field: Field) u64 {
 /// most entries that budget can hold. See `Decoder.fieldsMax`.
 pub const overhead: u64 = 32;
 
-pub fn eql(field: Field, other: Field) bool {
+pub fn eql(field: *const Field, other: *const Field) bool {
     if (!std.mem.eql(u8, field.name, other.name)) return false;
     return std.mem.eql(u8, field.value, other.value);
 }

@@ -1,9 +1,15 @@
 //! RFC 7541 Appendix B: the fixed Huffman code table.
 //!
 //! Generated from the RFC and cross-checked against golang.org/x/net/http2/hpack.
-//! The comptime block below re-proves the properties the decoder relies on, so a
-//! transcription error is a compile error rather than a wrong answer: every code
-//! fits its stated length, and the code is prefix-free.
+//! The comptime block below re-proves what can be checked from this table
+//! alone, so a transcription error is a compile error rather than a wrong
+//! answer: every code lies within its stated length, and the lengths are in
+//! range.
+//!
+//! Prefix-freeness is the other property the decoder rests on, and it is proven
+//! where it is used rather than here: `huffman.buildTree` asserts that no code
+//! descends through a leaf and that none lands on an interior node, which is
+//! both halves of it, and then that the tree came out complete.
 
 const std = @import("std");
 

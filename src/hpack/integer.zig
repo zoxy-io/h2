@@ -25,6 +25,12 @@ const assert = std.debug.assert;
 /// buys an attacker a longer walk. The decode still range-checks the result:
 /// five octets can *encode* more than `u32` holds, and this bound is about
 /// terminating rather than about fitting.
+///
+/// It is worth being explicit that this is stricter than RFC 7541 section 5.1,
+/// which sets no limit: a peer may pad an integer with zero-valued groups
+/// indefinitely and still be conformant, and such an encoding is rejected here
+/// as `TooLarge`. That is the right direction for a decoder facing the open
+/// internet, and it is a deliberate deviation rather than an oversight.
 pub const continuation_octets_max: u32 = 5;
 
 /// The widest prefix section 5.1 defines. A prefix is the low bits of an octet
@@ -32,6 +38,15 @@ pub const continuation_octets_max: u32 = 5;
 /// representation with no tag bits — a dynamic table size update's successor,
 /// and string lengths — uses seven.
 pub const prefix_bits_max: u4 = 8;
+
+comptime {
+    // The shift in `decode` is a `u6`, and it reaches 7 per continuation octet.
+    assert(continuation_octets_max * 7 <= std.math.maxInt(u6));
+    // And five groups have to cover every `u32`, which is the claim the doc
+    // above makes about why five is enough.
+    assert(continuation_octets_max * 7 >= 32);
+    assert(prefix_bits_max >= 1);
+}
 
 pub const DecodeError = error{
     /// The encoding continues past the end of the input. The caller may have
@@ -67,22 +82,26 @@ pub fn decode(source: []const u8, prefix_bits: u4) DecodeError!Decoded {
     // than a wrap that has already lost the evidence.
     var value: u64 = prefix_max;
     var shift: u6 = 0;
-    var octets: u32 = 0;
-    while (octets < continuation_octets_max) {
-        const index = octets + 1;
+    var continuation_octets: u32 = 0;
+    while (continuation_octets < continuation_octets_max) {
+        const index = continuation_octets + 1;
         if (index >= source.len) return error.Incomplete;
         const octet = source[index];
-        octets += 1;
+        continuation_octets += 1;
 
         value += @as(u64, octet & 0x7f) << shift;
         if (octet & 0x80 == 0) {
             if (value > std.math.maxInt(u32)) return error.TooLarge;
-            assert(octets >= 1);
-            return .{ .value = @intCast(value), .octets = octets + 1 };
+            const decoded: Decoded = .{
+                .value = @intCast(value),
+                .octets = continuation_octets + 1,
+            };
+            assert(decoded.octets <= continuation_octets_max + 1);
+            return decoded;
         }
         shift += 7;
     }
-    assert(octets == continuation_octets_max);
+    assert(continuation_octets == continuation_octets_max);
     return error.TooLarge;
 }
 
@@ -101,31 +120,40 @@ pub fn encode(target: []u8, value: u32, prefix_bits: u4, tag: u8) EncodeError!u3
     assert(prefix_bits >= 1);
     assert(prefix_bits <= prefix_bits_max);
     // The tag must not reach into the prefix, or it would be read back as part
-    // of the value.
-    assert(prefix_bits == prefix_bits_max or (tag & ((@as(u16, 1) << prefix_bits) - 1)) == 0);
-    if (target.len == 0) return error.OutputTooLong;
+    // of the value. An eight-bit prefix leaves no room for a tag at all, so
+    // there is nothing to check there.
+    if (prefix_bits < prefix_bits_max) {
+        assert((tag & ((@as(u16, 1) << prefix_bits) - 1)) == 0);
+    }
+
+    // Checked once, up front, so this function either writes the whole encoding
+    // or touches nothing. `huffman.encode` has the same contract, and a caller
+    // writing a length followed by a Huffman string composes exactly the two —
+    // one of them leaving a half-written prefix behind on failure would be a
+    // trap set for whoever writes that caller.
+    const length = encodedLength(value, prefix_bits);
+    if (length > target.len) return error.OutputTooLong;
 
     const prefix_max: u32 = (@as(u32, 1) << prefix_bits) - 1;
     if (value < prefix_max) {
         target[0] = tag | @as(u8, @intCast(value));
+        assert(length == 1);
         return 1;
     }
 
     target[0] = tag | @as(u8, @intCast(prefix_max));
     var remaining: u32 = value - prefix_max;
-    var octets: u32 = 1;
+    var index: u32 = 1;
     while (remaining >= 0x80) {
-        if (octets >= target.len) return error.OutputTooLong;
-        target[octets] = @as(u8, @truncate(remaining)) | 0x80;
-        octets += 1;
+        assert(index < length);
+        target[index] = @as(u8, @truncate(remaining)) | 0x80;
+        index += 1;
         remaining >>= 7;
-        assert(octets <= continuation_octets_max + 1);
     }
-    if (octets >= target.len) return error.OutputTooLong;
-    target[octets] = @intCast(remaining);
-    octets += 1;
-    assert(octets >= 2);
-    return octets;
+    assert(index < length);
+    target[index] = @intCast(remaining);
+    assert(index + 1 == length);
+    return length;
 }
 
 /// Octets `encode` would write. Lets a caller check space once for a whole
@@ -141,8 +169,9 @@ pub fn encodedLength(value: u32, prefix_bits: u4) u32 {
     while (remaining >= 0x80) {
         octets += 1;
         remaining >>= 7;
+        assert(octets <= continuation_octets_max);
     }
-    assert(octets <= continuation_octets_max + 1);
+    assert(octets <= continuation_octets_max);
     return octets + 1;
 }
 
