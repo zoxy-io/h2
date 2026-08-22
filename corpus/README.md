@@ -1,4 +1,17 @@
-# Interoperability corpus
+# Vendored corpora
+
+Two unrelated corpora, both MIT licensed and both vendored byte-identical to
+upstream so a diff against the named commit is the whole audit.
+
+- [`hpack/`](#hpack-interoperability) — HPACK encodings from other
+  implementations, for #1.
+- [`frames/`](#http2-frame-fixtures) — HTTP/2 frame fixtures, for #2.
+
+They share one test binary (`zig build corpus`) because both need an allocator
+and a JSON parser, and neither belongs in a package that promises no allocator
+and ships no fixtures.
+
+# HPACK interoperability
 
 Vendored from [http2jp/hpack-test-case](https://github.com/http2jp/hpack-test-case)
 at commit `8a1406e7d14bfcb6c046021f13cc15cfb162726d` (2019-06-01), MIT licensed.
@@ -54,3 +67,62 @@ the dynamic table through many evictions. 600 cases in total.
 ## Running it
 
 `zig build corpus`, and it is part of `zig build ci`.
+
+# HTTP/2 frame fixtures
+
+Vendored from [http2jp/http2-frame-test-case](https://github.com/http2jp/http2-frame-test-case),
+MIT licensed (`frames/LICENSE`). All 34 fixtures, because the whole corpus is
+140 KiB — there is nothing to select.
+
+Each fixture is one frame: a hex `wire`, and either a decoded `frame` or a
+`null` frame with a list of RFC 9113 section 7 error codes the decode must
+produce.
+
+## What it covers
+
+Twelve valid frames, one for every frame type RFC 9113 defines:
+
+| type | fixture | notes |
+|---|---|---|
+| DATA | `data/normal` | padded |
+| HEADERS | `headers/normal`, `headers/priority` | the second carries the priority fields and padding |
+| PRIORITY | `priority/normal` | |
+| RST_STREAM | `rst_stream/normal` | |
+| SETTINGS | `settings/normal` | two parameters |
+| PUSH_PROMISE | `push_promise/normal` | padded |
+| PING | `ping/normal` | |
+| GOAWAY | `goaway/normal` | with debug data |
+| WINDOW_UPDATE | `window_update/normal` | |
+| CONTINUATION | `continuation/normal`, `continuation/header` | |
+
+And twenty-two error cases, which are the more valuable half. They map onto the
+rules #2 lists almost one for one:
+
+| rule | fixtures |
+|---|---|
+| padding at least the declared length | `data-frame-padding`, `headers-frame-padding`, `push_promise-frame-padding` |
+| frame size fixed per type | `priority-`, `rst_stream-`, `ping-`, `window_update-`, `goaway-`, `data-frame-size` |
+| SETTINGS a multiple of six, and empty when ACK | `settings-frame-size`, `settings-frame-ack-size` |
+| stream identifier valid for the type | one per type: `data-`, `headers-`, `priority-`, `rst_stream-`, `settings-`, `push_promise-`, `ping-`, `goaway-frame-stream` |
+| WINDOW_UPDATE increment non-zero | `window_update-frame-increment` |
+| promised stream identifier even and non-zero | `push_promise-frame-promised_stream-odd`, `-zero` |
+
+Every case names `PROTOCOL_ERROR` or `FRAME_SIZE_ERROR`, and
+`push_promise-frame-padding` accepts either — which is itself worth knowing,
+because it means the codec is not obliged to pick one and a test that demands a
+single code would be wrong.
+
+**Not covered:** unknown frame types, which RFC 9113 section 4.1 requires be
+ignored rather than rejected; frames exceeding `SETTINGS_MAX_FRAME_SIZE`, since
+a fixture cannot know what was negotiated; and the CONTINUATION flood, which is
+a property of a sequence rather than of one frame. Those need tests this package
+writes itself.
+
+## Status
+
+`corpus/frames.zig` today checks that every fixture's declared metadata agrees
+with its own octets — length, type, flags and stream identifier read back out of
+the wire. That guards the vendored data and records a reading of the nine-octet
+header independent of `src/`, so the codec is built against an expectation that
+already exists. The conformance gate proper, decoding these with the codec and
+comparing payloads and error codes, arrives with #2's first slice.

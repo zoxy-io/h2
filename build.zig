@@ -99,14 +99,14 @@ pub fn build(b: *std.Build) void {
     // parser and 828 KiB of fixtures, none of which belong in the package.
     const corpus_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("corpus/conformance.zig"),
+            .root_source_file = b.path("corpus/all.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{.{ .name = "h2", .module = h2_module }},
         }),
     });
     const corpus_run = b.addRunArtifact(corpus_tests);
-    const corpus_step = b.step("corpus", "Interoperability conformance (http2jp/hpack-test-case)");
+    const corpus_step = b.step("corpus", "Vendored corpora: HPACK interop and HTTP/2 frame fixtures");
     corpus_step.dependOn(&corpus_run.step);
 
     const test_step = b.step("test", "Run unit tests, the lint's own tests, and the fuzz corpus");
@@ -119,7 +119,7 @@ pub fn build(b: *std.Build) void {
     // The format gate. A build step rather than a documented `zig fmt --check`
     // incantation, so that the list of formatted paths lives in exactly one
     // place and CI cannot check a different set than a developer does.
-    const fmt_paths = &.{ "src", "scripts", "bench", "fuzz", "corpus/conformance.zig", "build.zig", "build.zig.zon" };
+    const fmt_paths = &.{ "src", "scripts", "bench", "fuzz", "corpus/all.zig", "corpus/hpack.zig", "corpus/frames.zig", "build.zig", "build.zig.zon" };
     const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
     const fmt_step = b.step("fmt", "Check formatting (zig build fmt-fix rewrites)");
     fmt_step.dependOn(&fmt_check.step);

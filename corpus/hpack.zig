@@ -32,16 +32,16 @@ const Story = struct {
 };
 
 const stories = [_]Story{
-    .{ .implementation = "nghttp2", .story = "story_00", .json = @embedFile("nghttp2/story_00.json") },
-    .{ .implementation = "nghttp2", .story = "story_26", .json = @embedFile("nghttp2/story_26.json") },
-    .{ .implementation = "nghttp2-change-table-size", .story = "story_00", .json = @embedFile("nghttp2-change-table-size/story_00.json") },
-    .{ .implementation = "nghttp2-change-table-size", .story = "story_26", .json = @embedFile("nghttp2-change-table-size/story_26.json") },
-    .{ .implementation = "haskell-http2-naive", .story = "story_00", .json = @embedFile("haskell-http2-naive/story_00.json") },
-    .{ .implementation = "haskell-http2-naive", .story = "story_26", .json = @embedFile("haskell-http2-naive/story_26.json") },
-    .{ .implementation = "haskell-http2-static", .story = "story_00", .json = @embedFile("haskell-http2-static/story_00.json") },
-    .{ .implementation = "haskell-http2-static", .story = "story_26", .json = @embedFile("haskell-http2-static/story_26.json") },
-    .{ .implementation = "haskell-http2-linear-huffman", .story = "story_00", .json = @embedFile("haskell-http2-linear-huffman/story_00.json") },
-    .{ .implementation = "haskell-http2-linear-huffman", .story = "story_26", .json = @embedFile("haskell-http2-linear-huffman/story_26.json") },
+    .{ .implementation = "nghttp2", .story = "story_00", .json = @embedFile("hpack/nghttp2/story_00.json") },
+    .{ .implementation = "nghttp2", .story = "story_26", .json = @embedFile("hpack/nghttp2/story_26.json") },
+    .{ .implementation = "nghttp2-change-table-size", .story = "story_00", .json = @embedFile("hpack/nghttp2-change-table-size/story_00.json") },
+    .{ .implementation = "nghttp2-change-table-size", .story = "story_26", .json = @embedFile("hpack/nghttp2-change-table-size/story_26.json") },
+    .{ .implementation = "haskell-http2-naive", .story = "story_00", .json = @embedFile("hpack/haskell-http2-naive/story_00.json") },
+    .{ .implementation = "haskell-http2-naive", .story = "story_26", .json = @embedFile("hpack/haskell-http2-naive/story_26.json") },
+    .{ .implementation = "haskell-http2-static", .story = "story_00", .json = @embedFile("hpack/haskell-http2-static/story_00.json") },
+    .{ .implementation = "haskell-http2-static", .story = "story_26", .json = @embedFile("hpack/haskell-http2-static/story_26.json") },
+    .{ .implementation = "haskell-http2-linear-huffman", .story = "story_00", .json = @embedFile("hpack/haskell-http2-linear-huffman/story_00.json") },
+    .{ .implementation = "haskell-http2-linear-huffman", .story = "story_26", .json = @embedFile("hpack/haskell-http2-linear-huffman/story_26.json") },
 };
 
 /// Longest case in the vendored selection is 466 octets; this is slack.
