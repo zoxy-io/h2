@@ -1,0 +1,483 @@
+//! Build-time lint for the two promises this package makes in its README, so
+//! that neither can be broken quietly.
+//!
+//! **No I/O types in the seam.** `std.Io`, `std.posix`, `std.os`, `std.net`
+//! and `std.fs` may not be named anywhere under `src/`. A header codec has no
+//! business doing I/O, so this is mostly a rule against a temptation rather
+//! than against a mistake — and the temptation is specific: a frame codec
+//! wants to be written as `readFrame(reader)`. It cannot be. The two
+//! consumers do not share a runtime — zoxy drives libxev completion
+//! callbacks, zrk drives zio green threads through `std.Io` — so a reader or
+//! writer in the seam excludes one of them. Bytes in, decoded frames and
+//! header fields out; the encoder writes into a caller-owned `[]u8`.
+//!
+//! **No allocator.** `std.mem.Allocator` may not appear either. Every buffer
+//! is caller-owned and caller-sized, HPACK's dynamic table included. Tests
+//! that need one use `std.testing.allocator`, which is a different needle.
+//!
+//! `@cImport` is forbidden for the same reason ztls and hparse forbid it:
+//! zero dependencies beyond the Zig toolchain, and a C surface is not one you
+//! open by accident.
+//!
+//! The unbounded-loop rule is the one carried over from zoxy verbatim, and
+//! matters more here than it does there — HPACK is the compression-bomb
+//! surface and CONTINUATION frames are the unbounded-loop surface.
+//!
+//! Ported from zoxy-io/zoxy `scripts/lint.zig`. Runs as `zig build lint` with
+//! the source root as its single argument.
+
+const std = @import("std");
+
+const assert = std.debug.assert;
+
+/// Bounded walk: a source tree past this size is itself a lint failure —
+/// raise deliberately if the package legitimately grows.
+const files_max: u32 = 128;
+const file_bytes_max: u32 = 1024 * 1024;
+
+/// One forbidden name: a needle that may appear only under `confined_to`.
+/// Data rather than code, so adding a boundary is a row here instead of
+/// another parameter threaded through `lintLine` and every one of its tests.
+const Boundary = struct {
+    needle: []const u8,
+    /// A path prefix (`"hpack/"`) or an exact file (`"root.zig"`), always
+    /// written with forward slashes; `pathIsUnder` normalizes. Empty means
+    /// the needle is allowed nowhere, which is every row today: this package
+    /// has no privileged directory, and adding one should take an argument.
+    confined_to: []const u8,
+    message: []const u8,
+};
+
+const no_io_message =
+    "no I/O in the seam: two consumers on two runtimes, so a reader or writer " ++
+    "here would exclude one of them (docs/TIGER_STYLE.md)";
+
+const boundaries = [_]Boundary{
+    .{
+        .needle = "@cImport",
+        .confined_to = "",
+        .message = "@cImport is forbidden: zero dependencies beyond the Zig toolchain",
+    },
+    .{
+        .needle = "std.mem.Allocator",
+        .confined_to = "",
+        .message = "no allocator: buffers are caller-owned and caller-sized " ++
+            "(tests use std.testing.allocator)",
+    },
+    .{ .needle = "std.Io", .confined_to = "", .message = no_io_message },
+    .{ .needle = "std.posix", .confined_to = "", .message = no_io_message },
+    .{ .needle = "std.os", .confined_to = "", .message = no_io_message },
+    .{ .needle = "std.net", .confined_to = "", .message = no_io_message },
+    .{ .needle = "std.fs", .confined_to = "", .message = no_io_message },
+};
+
+/// TIGER_STYLE's "put a limit on everything", made mechanical: `while (true)`
+/// states no bound of its own, so it must carry one where a reviewer can see
+/// it. Two shapes count.
+///
+/// An asserted counter:
+///
+///     while (true) : (passes += 1) {
+///         assert(passes <= continuation_frames_max);
+///
+/// Or a bound the syntax cannot show, which says so at the site with the
+/// marker below and a reason.
+///
+/// The rule exists because of zoxy-io/zoxy#222: a `while (true) ... catch
+/// continue` sized for a once-in-2^32 bad scalar met a persistently full heap
+/// and spun at 100% CPU forever, taking both listeners and the admin plane
+/// with it. An unbounded loop is a claim that some condition always
+/// eventually holds; this makes the claim reviewable instead of implicit.
+const unbounded_loop_needle = "while (true)";
+const unbounded_loop_marker = "lint:unbounded-ok";
+const unbounded_loop_message =
+    "unbounded `while (true)`: assert a counter bound in the loop body, " ++
+    "or mark it `lint:unbounded-ok — <why>` (TIGER_STYLE: put a limit on everything)";
+
+/// Lines after the loop header within which the bound assertion must appear.
+/// The assertion belongs at the top of the body, so this is deliberately
+/// short — far enough to clear a comment between header and assert, near
+/// enough that an unrelated `assert` deeper in the loop cannot satisfy it by
+/// accident.
+const loop_bound_lookahead_lines: u32 = 6;
+
+pub fn main(init: std.process.Init) !u8 {
+    const arena = init.arena.allocator();
+    const io = init.io;
+
+    const args = try init.minimal.args.toSlice(arena);
+    assert(args.len >= 1);
+    if (args.len != 2) {
+        std.debug.print("usage: lint <source-root>\n", .{});
+        return 2;
+    }
+
+    var root = try std.Io.Dir.cwd().openDir(io, args[1], .{ .iterate = true });
+    defer root.close(io);
+
+    var violation_count: u32 = 0;
+    var file_count: u32 = 0;
+    var walker = try root.walk(arena);
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) {
+            continue;
+        }
+        if (!std.mem.endsWith(u8, entry.path, ".zig")) {
+            continue;
+        }
+        file_count += 1;
+        assert(file_count <= files_max);
+        violation_count += try lintFile(arena, io, root, entry.path);
+    }
+    assert(file_count >= 1);
+
+    if (violation_count > 0) {
+        std.debug.print("lint: {d} violation(s)\n", .{violation_count});
+        return 1;
+    }
+    return 0;
+}
+
+fn lintFile(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    path: []const u8,
+) !u32 {
+    assert(path.len > 0);
+    const contents = try root.readFileAlloc(io, path, arena, .limited(file_bytes_max));
+    assert(contents.len < file_bytes_max);
+
+    var violation_count: u32 = 0;
+    var line_number: u32 = 0;
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |line| {
+        line_number += 1;
+        if (lintLine(line, path)) |message| {
+            std.debug.print("{s}:{d}: {s}\n", .{ path, line_number, message });
+            violation_count += 1;
+        }
+    }
+    assert(line_number >= 1);
+    return violation_count + lintUnboundedLoops(contents, path);
+}
+
+/// Returns a violation message for the line, or null if the line is clean.
+///
+/// Diverges from zoxy's original in one place: a comment-only line is exempt.
+/// zoxy flags every line because its allowlist could otherwise be ridden by a
+/// comment sharing a line with a real call — but a line that is *only* a
+/// comment has no call to hide, and every rule here needs to be explainable
+/// in prose inside the very files it governs (`src/root.zig` cannot say "this
+/// package names no `std.Io`" otherwise). A line carrying both code and a
+/// trailing comment is not comment-only, so the original's counter-example
+/// stays caught.
+fn lintLine(line: []const u8, path: []const u8) ?[]const u8 {
+    assert(path.len > 0);
+    if (lineIsComment(line)) {
+        return null;
+    }
+    for (boundaries) |boundary| {
+        if (pathIsUnder(path, boundary.confined_to)) continue;
+        if (std.mem.indexOf(u8, line, boundary.needle) != null) {
+            return boundary.message;
+        }
+    }
+    return null;
+}
+
+/// Flag every `while (true)` whose bound is neither asserted nor declared. A
+/// pass of its own rather than a `lintLine` rule because the evidence is not
+/// on the line: the bound lives in the body below the header, which is
+/// exactly why a line-at-a-time reader — human or lint — would miss it.
+fn lintUnboundedLoops(contents: []const u8, path: []const u8) u32 {
+    assert(path.len > 0);
+    var violation_count: u32 = 0;
+    var offset: usize = 0;
+    while (nextUnboundedLoop(contents, offset)) |at| {
+        offset = at + unbounded_loop_needle.len;
+        assert(offset > at);
+        std.debug.print("{s}:{d}: {s}\n", .{
+            path,
+            lineNumberAt(contents, at),
+            unbounded_loop_message,
+        });
+        violation_count += 1;
+    }
+    return violation_count;
+}
+
+/// Offset of the next unbounded `while (true)` at or after `from`, or null
+/// when the rest is clean. The decision lives here, apart from the report, so
+/// a test can make it without printing a violation it went looking for.
+fn nextUnboundedLoop(contents: []const u8, from: usize) ?usize {
+    assert(from <= contents.len);
+    var offset = from;
+    // Bounded: every iteration moves `offset` past the match it found, so this
+    // runs at most once per occurrence in a file `lintFile` has already held
+    // under `file_bytes_max`.
+    while (std.mem.indexOfPos(u8, contents, offset, unbounded_loop_needle)) |at| {
+        offset = at + unbounded_loop_needle.len;
+        assert(offset > at);
+        const start = lineStartOf(contents, at);
+        const end = lineEndOf(contents, at);
+        assert(start <= at);
+        assert(end >= at);
+        const line = contents[start..end];
+        // A loop named in prose — this file's own doc comments above, or a
+        // `// Bounded: …` note — is not a loop.
+        if (lineIsComment(line)) continue;
+        if (markedUnboundedOk(contents, start, line)) continue;
+        if (boundAssertedWithin(contents[end..], loop_bound_lookahead_lines)) continue;
+        return at;
+    }
+    return null;
+}
+
+/// The count without the report — what the tests below assert on.
+fn countUnboundedLoops(contents: []const u8) u32 {
+    var count: u32 = 0;
+    var offset: usize = 0;
+    while (nextUnboundedLoop(contents, offset)) |at| {
+        offset = at + unbounded_loop_needle.len;
+        assert(offset > at);
+        count += 1;
+    }
+    return count;
+}
+
+/// True when the loop declares itself structurally bounded: the marker sits
+/// either on the header line or on the comment line directly above it. Both
+/// are accepted because the reason is what matters and it rarely fits after
+/// `while (true) {`.
+fn markedUnboundedOk(contents: []const u8, start: usize, line: []const u8) bool {
+    assert(start <= contents.len);
+    if (std.mem.indexOf(u8, line, unbounded_loop_marker) != null) return true;
+    if (start == 0) return false;
+    const above_end = start - 1; // The '\n' that ended the line above.
+    const above_start = lineStartOf(contents, above_end);
+    assert(above_start <= above_end);
+    const above = contents[above_start..above_end];
+    if (!lineIsComment(above)) return false;
+    return std.mem.indexOf(u8, above, unbounded_loop_marker) != null;
+}
+
+/// True when one of the next `lines_max` lines asserts an upper bound — any
+/// `assert` naming a `<` relation. Deliberately shape-based rather than
+/// parsing the counter out of the loop header: the point is that a bound is
+/// stated near the top of the body, and every way of writing
+/// `assert(n <= max)` should satisfy it.
+fn boundAssertedWithin(rest: []const u8, lines_max: u32) bool {
+    assert(lines_max >= 1);
+    var lines = std.mem.splitScalar(u8, rest, '\n');
+    var seen: u32 = 0;
+    while (lines.next()) |line| {
+        if (seen == lines_max) return false;
+        seen += 1;
+        if (std.mem.indexOf(u8, line, "assert(") == null) continue;
+        // `<=` contains `<`, so the one test covers both relations.
+        if (std.mem.indexOfScalar(u8, line, '<') != null) return true;
+    }
+    assert(seen <= lines_max);
+    return false;
+}
+
+fn lineStartOf(contents: []const u8, at: usize) usize {
+    assert(at < contents.len);
+    const newline = std.mem.lastIndexOfScalar(u8, contents[0..at], '\n') orelse return 0;
+    assert(newline < at);
+    return newline + 1;
+}
+
+fn lineEndOf(contents: []const u8, at: usize) usize {
+    assert(at < contents.len);
+    const newline = std.mem.indexOfScalarPos(u8, contents, at, '\n') orelse return contents.len;
+    assert(newline >= at);
+    return newline;
+}
+
+fn lineNumberAt(contents: []const u8, at: usize) u32 {
+    assert(at < contents.len);
+    return @intCast(std.mem.count(u8, contents[0..at], "\n") + 1);
+}
+
+/// True when the line's first non-blank characters are `//` — a doc comment,
+/// a module comment, or an ordinary one.
+fn lineIsComment(line: []const u8) bool {
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    assert(trimmed.len <= line.len);
+    return std.mem.startsWith(u8, trimmed, "//");
+}
+
+comptime {
+    // Every path here — the walked one and the confinements above — is
+    // compared byte-for-byte with '/' as the separator. Unlike zoxy, this
+    // package does support Windows (hparse's CI proves the same for a sibling
+    // parser), so if a '\\' host ever runs the lint this assertion is the
+    // thing that says it needs real path handling rather than silently
+    // passing every boundary.
+    assert(std.fs.path.sep == '/');
+}
+
+/// True when `path` is the file named by `confinement`, or lies under it as a
+/// directory prefix. A `confinement` ending in '/' is a directory, anything
+/// else an exact file; empty confines a needle to nowhere.
+fn pathIsUnder(path: []const u8, confinement: []const u8) bool {
+    assert(path.len > 0);
+    // The confinements are written in this file, so a stray separator is a
+    // typo in a table row, not untrusted input.
+    assert(std.mem.indexOfScalar(u8, confinement, '\\') == null);
+    if (confinement.len == 0) return false;
+    if (confinement[confinement.len - 1] != '/') {
+        return std.mem.eql(u8, path, confinement);
+    }
+    const directory = confinement[0 .. confinement.len - 1];
+    assert(directory.len >= 1);
+    if (!std.mem.startsWith(u8, path, directory)) return false;
+    // A sibling whose name merely starts the same is not under it: the byte
+    // after the directory must be the separator, never more name.
+    if (path.len == directory.len) return false;
+    return path[directory.len] == '/';
+}
+
+test "lintLine: I/O types are forbidden everywhere" {
+    try std.testing.expect(lintLine("const io = std.Io;", "hpack/Decoder.zig") != null);
+    try std.testing.expect(lintLine("var w: std.Io.Writer = undefined;", "frame.zig") != null);
+    try std.testing.expect(lintLine("_ = std.posix.read(fd, buf);", "root.zig") != null);
+    try std.testing.expect(lintLine("_ = std.os.linux.close(fd);", "root.zig") != null);
+    try std.testing.expect(lintLine("const s = std.net.Stream;", "root.zig") != null);
+    try std.testing.expect(lintLine("const f = std.fs.File;", "root.zig") != null);
+    try std.testing.expect(lintLine("const decoded = decodeHuffman(source, target);", "hpack.zig") == null);
+}
+
+test "lintLine: no allocator, but std.testing.allocator is a different needle" {
+    try std.testing.expect(lintLine("fn init(gpa: std.mem.Allocator) void {}", "hpack.zig") != null);
+    try std.testing.expect(lintLine("const a = std.testing.allocator;", "hpack.zig") == null);
+}
+
+test "lintLine: @cImport is forbidden" {
+    try std.testing.expect(lintLine("const c = @cImport({});", "frame.zig") != null);
+}
+
+test "lintLine: a comment-only line explains a rule without tripping it" {
+    // The divergence from zoxy's original, and the reason for it: these files
+    // have to be able to describe their own constraints.
+    try std.testing.expect(lintLine("//! This package never names std.Io.", "root.zig") == null);
+    try std.testing.expect(lintLine("    // Not even std.posix here.", "frame.zig") == null);
+    // A real call sharing a line with a comment is still caught.
+    try std.testing.expect(lintLine("const x = std.posix.read(); // harmless?", "frame.zig") != null);
+}
+
+test "lintUnboundedLoops: a bare while (true) is a violation" {
+    const source =
+        \\fn spin() void {
+        \\    while (true) {
+        \\        step();
+        \\    }
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 1), countUnboundedLoops(source));
+}
+
+test "lintUnboundedLoops: an asserted counter bound satisfies the rule" {
+    const source =
+        \\fn readContinuations() void {
+        \\    var frames: u32 = 0;
+        \\    while (true) : (frames += 1) {
+        \\        assert(frames <= continuation_frames_max);
+        \\        if (done()) break;
+        \\    }
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 0), countUnboundedLoops(source));
+}
+
+test "lintUnboundedLoops: the marker exempts a structurally-bounded loop" {
+    const source =
+        \\fn parse() !void {
+        \\    while (true) { // lint:unbounded-ok — the block ends at its own length
+        \\        if (try next() == .end) break;
+        \\    }
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 0), countUnboundedLoops(source));
+}
+
+test "lintUnboundedLoops: the marker is accepted on the line above" {
+    const source =
+        \\fn parse() !void {
+        \\    // lint:unbounded-ok — the block ends at its own length
+        \\    while (true) {
+        \\        if (try next() == .end) break;
+        \\    }
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 0), countUnboundedLoops(source));
+    // Only *directly* above: a blank line between them breaks the pairing, so
+    // a stale marker cannot drift onto an unrelated loop.
+    const detached =
+        \\fn parse() !void {
+        \\    // lint:unbounded-ok — the block ends at its own length
+        \\
+        \\    while (true) {
+        \\        step();
+        \\    }
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 1), countUnboundedLoops(detached));
+}
+
+test "lintUnboundedLoops: prose about a loop is not a loop" {
+    const source =
+        \\/// Bounded, unlike a bare `while (true)`, which this is not.
+        \\fn ok() void {}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 0), countUnboundedLoops(source));
+}
+
+test "lintUnboundedLoops: an assert too far below the header does not count" {
+    const source =
+        \\while (true) {
+        \\    a();
+        \\    b();
+        \\    c();
+        \\    d();
+        \\    e();
+        \\    f();
+        \\    assert(n <= max);
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 1), countUnboundedLoops(source));
+}
+
+test "lintUnboundedLoops: each unbounded loop in a file is counted" {
+    const source =
+        \\while (true) {
+        \\    a();
+        \\}
+        \\while (true) {
+        \\    b();
+        \\}
+        \\
+    ;
+    try std.testing.expectEqual(@as(u32, 2), countUnboundedLoops(source));
+}
+
+test "pathIsUnder: exact files, directory prefixes, and near misses" {
+    try std.testing.expect(pathIsUnder("hpack/Decoder.zig", "hpack/Decoder.zig"));
+    try std.testing.expect(!pathIsUnder("hpack/Decoder_test.zig", "hpack/Decoder.zig"));
+    try std.testing.expect(pathIsUnder("hpack/Decoder.zig", "hpack/"));
+    try std.testing.expect(pathIsUnder("hpack/sub/deep.zig", "hpack/"));
+    // A sibling directory whose name merely starts the same is not under it.
+    try std.testing.expect(!pathIsUnder("hpacked/thing.zig", "hpack/"));
+    try std.testing.expect(!pathIsUnder("hpack", "hpack/"));
+    // An empty spec confines a needle to nowhere.
+    try std.testing.expect(!pathIsUnder("anything.zig", ""));
+}

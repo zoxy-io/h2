@@ -2,10 +2,11 @@
 
 ![GitHub License](https://img.shields.io/github/license/zoxy-io/h2?color=orange)
 
-Sans-I/O HTTP/2 frame codec and HPACK. Powered by Zig ⚡
+HTTP/2 frame codec and HPACK. Powered by Zig ⚡
 
 **Pre-alpha — nothing is implemented yet.** This repository exists so the two
-pieces of HTTP/2 that are pure and I/O-free get written once and used twice.
+pieces of HTTP/2 that are pure — no I/O, no protocol state — get written once
+and used twice.
 
 ## Scope
 
@@ -13,20 +14,8 @@ pieces of HTTP/2 that are pure and I/O-free get written once and used twice.
 * **RFC 7541 HPACK** — encoder, decoder, Huffman, static and dynamic tables.
 
 Out of scope, permanently: sockets, TLS, ALPN, flow control policy, stream
-scheduling, and the connection state machine. Those differ per consumer and stay
-in the consumer.
-
-## Why sans-I/O
-
-The two consumers do not share a runtime:
-
-* [zoxy](https://github.com/zoxy-io/zoxy) drives libxev completion callbacks.
-* [zrk](https://github.com/zoxy-io/zrk) drives zio green threads through `std.Io`.
-
-Any I/O in this package would exclude one of them. Bytes in, frames and header
-fields out; the caller owns every transition. Same discipline as
-[hparse](https://github.com/zoxy-io/hparse) and
-[ztls](https://github.com/zoxy-io/ztls).
+scheduling, and the connection state machine. Those differ per consumer and
+stay in the consumer.
 
 ## Properties
 
@@ -35,10 +24,21 @@ fields out; the caller owns every transition. Same discipline as
 * Caller-owned, caller-sized buffers, including HPACK's dynamic table.
 * Zero dependencies beyond the Zig toolchain.
 
+## Consumers
+
+* [zoxy](https://github.com/zoxy-io/zoxy) — reverse proxy, drives libxev
+  completion callbacks.
+* [zrk](https://github.com/zoxy-io/zrk) — load generator, drives zio green
+  threads through `std.Io`.
+
+They do not share a runtime, which is why the API is bytes in, frames and
+header fields out: a reader or writer in the seam would exclude one of them.
+`zig build lint` enforces it.
+
 ## Style
 
 [`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md) — zoxy's TigerStyle, plus the
-deltas that being a shared sans-I/O library forces.
+deltas a shared library forces.
 
 ## Context
 

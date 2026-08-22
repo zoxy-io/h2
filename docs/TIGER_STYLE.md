@@ -3,7 +3,7 @@
 h2 adopts [zoxy's TIGER_STYLE](https://github.com/zoxy-io/zoxy/blob/main/docs/TIGER_STYLE.md),
 which in turn adopts [TigerBeetle's](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
 Those are the source of truth. This file records only the **deltas** that being a
-sans-I/O library shared by two different runtimes forces.
+library shared by two different runtimes forces.
 
 > Design goals, in priority order: **safety, performance, developer experience.**
 
@@ -62,19 +62,17 @@ zoxy states this rule, then gives zoxy's reason: "this is why our I/O is
 callback-based (see DESIGN.md §I/O)". That rationale is a property of zoxy's
 event loop and does not transfer.
 
-The rule is satisfied here for a stronger reason: **this library performs no I/O
-at all.** No sockets, no `std.Io`, no `Io.Reader`/`Io.Writer` in the core. It
-cannot have any, because its two consumers do not share a runtime — zoxy drives
-libxev completion callbacks, zrk drives zio green threads through `std.Io`. Bytes
-in, decoded frames and header fields out; the caller owns every transition.
-
-That constraint is not a compromise. It is the entire reason a shared package is
-possible.
+Here the rule is satisfied trivially — a header codec does no I/O — so it needs
+no restating. What does need stating is the part that is *not* obvious: no I/O
+**type** may appear in the seam either. The temptation is specific, because a
+frame codec wants to be written as `readFrame(reader)`. It cannot be. The two
+consumers do not share a runtime, so a reader or writer in the signature
+excludes one of them. Bytes in, frames and header fields out; the encoder writes
+into a caller-owned `[]u8`. `zig build lint` enforces it.
 
 Corollary: header fields are exposed as an **iterator**, not a callback. zoxy's
 "callbacks are the last parameter" rule is about its I/O seam, and a callback
-here would push each consumer's control flow into the library — the one thing
-sans-I/O exists to prevent.
+here would push each consumer's control flow into the library.
 
 ### The performance priority order
 
