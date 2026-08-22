@@ -392,12 +392,55 @@ fn expectPriority(want: *const std.json.ObjectMap, priority: frame.payload.Prior
 
 /// The corpus records a padding length and the padding itself, or null for
 /// both when the frame is not padded.
-fn expectPadding(want: *const std.json.ObjectMap, padding: []const u8) !void {
+fn expectPadding(want: *const std.json.ObjectMap, padding: ?[]const u8) !void {
     const length = want.get("padding_length") orelse return;
     if (length == .null) {
-        try std.testing.expectEqual(@as(usize, 0), padding.len);
+        // The corpus records null for an unpadded frame, and so does the codec.
+        try std.testing.expectEqual(@as(?[]const u8, null), padding);
         return;
     }
-    try std.testing.expectEqual(@as(usize, @intCast(length.integer)), padding.len);
-    try std.testing.expectEqualStrings(want.get("padding").?.string, padding);
+    try std.testing.expectEqual(@as(usize, @intCast(length.integer)), padding.?.len);
+    try std.testing.expectEqualStrings(want.get("padding").?.string, padding.?);
+}
+
+test "every valid fixture renders back to the octets it was parsed from" {
+    // The strongest check available for an encoder, and the one that closed
+    // HPACK's: byte equality against wire another implementation produced.
+    // A round trip against our own parser would only prove the two agree.
+    const allocator = std.testing.allocator;
+
+    var rendered_count: u32 = 0;
+    for (fixtures) |fixture| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, fixture.json, .{});
+        defer parsed.deinit();
+
+        const frame_value = parsed.value.object.get("frame").?;
+        if (frame_value == .null) continue;
+
+        var buffer: [wire_max]u8 = undefined;
+        const hex = parsed.value.object.get("wire").?.string;
+        const wire = try std.fmt.hexToBytes(&buffer, hex);
+        const header = try frame.Header.parse(wire);
+        const body = wire[frame.Header.octets..][0..header.length];
+        const payload = try frame.payload.parse(header, body);
+
+        // The sender's own flags. The structural ones are the codec's to
+        // derive, and a fixture whose flags come back different is a
+        // derivation that is wrong.
+        const sender_flags = header.flags & ~frame.payload.structuralFlags(&payload);
+
+        var target: [wire_max]u8 = undefined;
+        const written = try frame.payload.render(
+            &payload,
+            header.stream_identifier,
+            sender_flags,
+            &target,
+        );
+        std.testing.expectEqualSlices(u8, wire, target[0..written]) catch |err| {
+            std.debug.print("{s}/{s}: render\n", .{ fixture.category, fixture.name });
+            return err;
+        };
+        rendered_count += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 12), rendered_count);
 }

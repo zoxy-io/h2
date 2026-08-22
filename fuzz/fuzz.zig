@@ -145,19 +145,39 @@ fn fuzzFramePayload(_: void, smith: *std.testing.Smith) !void {
         return;
     };
 
+    // Whatever parsed must render back to the octets it came from. A codec
+    // that reads a frame it cannot write has lost something, and until the
+    // padding became optional it had: an unpadded frame and a zero-padded one
+    // both parsed to an empty padding slice and rendered as the same frame.
+    // A rendered frame is never longer than the wire it parsed from — the
+    // payload borrows those octets and the header is the same nine — which is
+    // what makes the `catch unreachable` below a proof rather than a hope.
+    if (payload != .unknown) {
+        var rendered: [input_max]u8 = undefined;
+        const sender_flags = header.flags & ~frame.payload.structuralFlags(&payload);
+        const written = frame.payload.render(
+            &payload,
+            header.stream_identifier,
+            sender_flags,
+            &rendered,
+        ) catch unreachable;
+        std.debug.assert(written == wire.len);
+        std.debug.assert(std.mem.eql(u8, rendered[0..written], wire));
+    }
+
     // Everything borrowed points into the payload it came from.
     switch (payload) {
         .data => |data| {
             assertBorrowed(body, data.data);
-            assertBorrowed(body, data.padding);
+            if (data.padding) |padding| assertBorrowed(body, padding);
         },
         .headers => |headers| {
             assertBorrowed(body, headers.fragment);
-            assertBorrowed(body, headers.padding);
+            if (headers.padding) |padding| assertBorrowed(body, padding);
         },
         .push_promise => |promise| {
             assertBorrowed(body, promise.fragment);
-            assertBorrowed(body, promise.padding);
+            if (promise.padding) |padding| assertBorrowed(body, padding);
             // Section 5.1.1, restated where a parse could get it wrong.
             std.debug.assert(promise.promised_stream_identifier % 2 == 0);
             std.debug.assert(promise.promised_stream_identifier != 0);

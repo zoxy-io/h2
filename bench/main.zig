@@ -47,6 +47,7 @@ const date_text = "Mon, 21 Oct 2013 20:13:21 GMT";
 const workloads = [_]Workload{
     .{ .name = "frame header", .run = benchFrameHeader },
     .{ .name = "frame parse", .run = benchFrameParse },
+    .{ .name = "frame render", .run = benchFrameRender },
     .{ .name = "hpack decode", .run = benchHpackDecode },
     .{ .name = "hpack encode", .run = benchHpackEncode },
     .{ .name = "hpack encode static", .run = benchHpackEncodeStatic },
@@ -138,6 +139,41 @@ fn benchFrameParse(iterations: u64) u64 {
                 .continuation => |continuation| continuation.fragment.len,
                 .unknown => |octets| octets.len,
             };
+            std.mem.doNotOptimizeAway(checksum);
+        }
+    }
+    return checksum;
+}
+
+/// Parse and render each frame, which is what forwarding one costs.
+///
+/// The parse is inside the loop on purpose: a payload borrows from the octets
+/// it was read from, so hoisting it would measure rendering against buffers a
+/// real forwarder does not keep. Read this as a delta against `frame parse`
+/// rather than as a rendering figure on its own.
+fn benchFrameRender(iterations: u64) u64 {
+    assert(iterations >= 1);
+    var checksum: u64 = 0;
+    var index: u64 = 0;
+    while (index < iterations) : (index += 1) {
+        for (frames) |wire| {
+            const header = h2.frame.Header.parse(wire) catch unreachable;
+            header.validate(h2.frame.Header.max_frame_size_min) catch continue;
+            const body = wire[h2.frame.Header.octets..][0..header.length];
+            const payload = h2.frame.payload.parse(header, body) catch continue;
+            // Not a workaround: `render` refuses an unknown type, and this
+            // measures forwarding frames that can be forwarded.
+            if (payload == .unknown) continue;
+
+            var target: [256]u8 = undefined;
+            const sender_flags = header.flags & ~h2.frame.payload.structuralFlags(&payload);
+            const written = h2.frame.payload.render(
+                &payload,
+                header.stream_identifier,
+                sender_flags,
+                &target,
+            ) catch continue;
+            checksum +%= written +% target[0];
             std.mem.doNotOptimizeAway(checksum);
         }
     }
