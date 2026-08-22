@@ -25,7 +25,16 @@ const bench_options = @import("bench_options");
 
 const h2 = @import("h2");
 
-const assert = std.debug.assert;
+/// Always on, whatever the optimize mode says.
+///
+/// `std.debug.assert` is elided in ReleaseFast, which this file hardcodes — so
+/// a setup check written with it does not run, and a workload that quietly
+/// decoded half of what it claimed would be reported as a fast one. The library
+/// has `-Dassertions` for that choice; a benchmark's own checks should not be
+/// switchable at all.
+fn assert(ok: bool) void {
+    if (!ok) @panic("bench: check failed");
+}
 
 const fields = h2.fields;
 const hpack = h2.hpack;
@@ -43,6 +52,101 @@ const stories = examples.stories;
 /// octets of text in 22 of wire.
 const date_text = "Mon, 21 Oct 2013 20:13:21 GMT";
 
+/// A browser request and the response to it, of the shape a reverse proxy
+/// actually forwards.
+///
+/// The Appendix C workload is what the RFC gives us and it is not what a proxy
+/// sees: four short stories, mostly indexed references, whose longest value is a
+/// 29-octet date. Issue #4 exists because a Huffman change that moved 25-46% at
+/// the kernel moved 6% there — and 6% of a workload that unrepresentative is not
+/// a number to decide anything with.
+///
+/// The values here are long on purpose and the lengths are the point: a real
+/// session cookie is hundreds of octets, a `set-cookie` carries attributes, and
+/// a content-security-policy is longer than most of the block.
+const heavy_request = [_]hpack.Field{
+    .{ .name = ":method", .value = "GET" },
+    .{ .name = ":scheme", .value = "https" },
+    .{ .name = ":authority", .value = "shop.example.com" },
+    .{ .name = ":path", .value = "/catalog/category/womens-outerwear?page=3&sort=price_asc&color=black&size=m" },
+    .{ .name = "user-agent", .value = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36" },
+    .{ .name = "accept", .value = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7" },
+    .{ .name = "accept-language", .value = "en-GB,en-US;q=0.9,en;q=0.8,ru;q=0.7" },
+    .{ .name = "accept-encoding", .value = "gzip, deflate, br, zstd" },
+    .{ .name = "referer", .value = "https://shop.example.com/catalog/category/womens-outerwear?page=2&sort=price_asc" },
+    .{ .name = "cookie", .value = "session_id=8f14e45fceea167a5a36dedd4bea2543; csrf_token=c9f0f895fb98ab9159f51fd0297e236d; " ++
+        "cart=eyJpdGVtcyI6W3siaWQiOjEyMzQsInF0eSI6Mn0seyJpZCI6NTY3OCwicXR5IjoxfV19; " ++
+        "_ga=GA1.2.1234567890.1698765432; _gid=GA1.2.9876543210.1698765432; " ++
+        "locale=en-GB; currency=GBP; consent=analytics:1,marketing:0,functional:1" },
+    .{ .name = "sec-ch-ua", .value = "\"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"121\", \"Chromium\";v=\"121\"" },
+    .{ .name = "sec-fetch-site", .value = "same-origin" },
+    .{ .name = "if-none-match", .value = "W/\"6a1f3c9b8e2d4f7a0c5b1e8d3f6a9c2b\"" },
+};
+
+const heavy_response = [_]hpack.Field{
+    .{ .name = ":status", .value = "200" },
+    .{ .name = "date", .value = "Fri, 22 Aug 2026 14:09:46 GMT" },
+    .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+    .{ .name = "content-length", .value = "48213" },
+    .{ .name = "cache-control", .value = "private, no-cache, no-store, max-age=0, must-revalidate" },
+    .{ .name = "set-cookie", .value = "session_id=3c59dc048e8850243be8079a5c74d079; Path=/; Expires=Sat, 23 Aug 2026 14:09:46 GMT; " ++
+        "Max-Age=86400; HttpOnly; Secure; SameSite=Lax; Domain=.example.com" },
+    .{ .name = "set-cookie", .value = "cart=eyJpdGVtcyI6W3siaWQiOjEyMzQsInF0eSI6M31dfQ; Path=/; Secure; SameSite=Lax" },
+    .{ .name = "strict-transport-security", .value = "max-age=63072000; includeSubDomains; preload" },
+    .{ .name = "content-security-policy", .value = "default-src \'self\'; script-src \'self\' \'unsafe-inline\' https://cdn.example.com; " ++
+        "img-src \'self\' data: https://images.example.com; frame-ancestors \'none\'" },
+    .{ .name = "link", .value = "</assets/app.8f14e45f.css>; rel=preload; as=style, " ++
+        "</assets/app.c9f0f895.js>; rel=preload; as=script, " ++
+        "<https://images.example.com>; rel=preconnect; crossorigin" },
+    .{ .name = "vary", .value = "Accept-Encoding, Accept-Language, Cookie" },
+    .{ .name = "etag", .value = "W/\"6a1f3c9b8e2d4f7a0c5b1e8d3f6a9c2b\"" },
+    .{ .name = "x-request-id", .value = "01JAXQ7K3M8P2N5R9T4V6W1Y0Z" },
+};
+
+/// Both blocks encoded at comptime, once with Huffman and once without.
+///
+/// Same fields, same order, same encoder mode — the only difference is the
+/// coding, which is what makes the pair a measurement of Huffman's share rather
+/// than of two unrelated workloads. `.static_only` so the two blocks are
+/// independent of each other and of the order they are decoded in; a dynamic
+/// context would make the second block cheap for reasons that have nothing to
+/// do with Huffman.
+fn encodeHeavy(
+    comptime source: []const hpack.Field,
+    comptime policy: hpack.Encoder.Huffman,
+) []const u8 {
+    comptime {
+        @setEvalBranchQuota(2_000_000);
+        var storage: hpack.Encoder.Storage(4096) = .{};
+        var encoder = storage.encoder(.static_only);
+        encoder.huffman = policy;
+        var buffer: [4096]u8 = undefined;
+        const encoded = encoder.encode(&buffer, source);
+        // A partial block would silently make this a shorter workload.
+        if (encoded.fields != source.len) @compileError("heavy block did not fit");
+        const frozen: [encoded.written]u8 = buffer[0..encoded.written].*;
+        return &frozen;
+    }
+}
+
+const heavy_coded = [_][]const u8{
+    encodeHeavy(&heavy_request, .always),
+    encodeHeavy(&heavy_response, .always),
+};
+
+const heavy_raw = [_][]const u8{
+    encodeHeavy(&heavy_request, .never),
+    encodeHeavy(&heavy_response, .never),
+};
+
+/// Octets of name and value text across both heavy blocks, from the source
+/// fields rather than from a decode.
+const heavy_octets = blk: {
+    var total: u64 = 0;
+    for (heavy_request ++ heavy_response) |field| total += field.name.len + field.value.len;
+    break :blk total;
+};
+
 /// Workloads are registered here and nowhere else, so adding one is a row
 /// rather than a new file with its own timing loop to get subtly wrong.
 const workloads = [_]Workload{
@@ -51,6 +155,8 @@ const workloads = [_]Workload{
     .{ .name = "frame render", .run = benchFrameRender },
     .{ .name = "block assembly", .run = benchBlockAssembly },
     .{ .name = "hpack decode", .run = benchHpackDecode },
+    .{ .name = "hpack decode heavy", .run = benchHpackDecodeHeavy, .divisor = 100 },
+    .{ .name = "hpack decode heavy raw", .run = benchHpackDecodeHeavyRaw, .divisor = 100 },
     .{ .name = "hpack encode", .run = benchHpackEncode },
     .{ .name = "hpack encode static", .run = benchHpackEncodeStatic },
     .{ .name = "huffman decode", .run = benchHuffmanDecode },
@@ -67,6 +173,14 @@ const workloads = [_]Workload{
 
 const Workload = struct {
     name: []const u8,
+    /// Iterations for this row are the run's count divided by this.
+    ///
+    /// A row whose unit of work is a whole header block costs microseconds
+    /// rather than nanoseconds, and at the default million iterations it would
+    /// add seconds to a gate that runs before every commit. `ns/op` stays
+    /// comparable because the divisor is applied to the count the result is
+    /// divided by as well.
+    divisor: u64 = 1,
     /// Runs `iterations` units of work and returns a value derived from all
     /// of them.
     ///
@@ -82,6 +196,8 @@ const Workload = struct {
 
 const Result = struct {
     name: []const u8,
+    /// Iterations this row actually ran, after its divisor.
+    iterations: u64,
     min_ns: u64,
     mean_ns: u64,
     max_ns: u64,
@@ -315,6 +431,77 @@ fn benchHpackDecode(iterations: u64) u64 {
         }
     }
     return checksum;
+}
+
+/// A header-heavy block with long values, decoded field by field.
+fn benchHpackDecodeHeavy(iterations: u64) u64 {
+    return benchDecodeBlocks(iterations, &heavy_coded);
+}
+
+/// The same fields, encoded without Huffman.
+///
+/// Not a workload anyone runs — it is the diagnostic that bounds every other
+/// number here that touches Huffman. One caveat on reading it: a literal that
+/// was not Huffman-coded is returned as a slice of the block itself
+/// (`Decoder.readString`), so this row skips the kernel *and* the write into the
+/// output buffer, while the coded row pays both. The gap is therefore the
+/// kernel plus a ~1.7 KiB copy, which makes it an upper bound on Huffman's
+/// share rather than the share itself.
+fn benchHpackDecodeHeavyRaw(iterations: u64) u64 {
+    return benchDecodeBlocks(iterations, &heavy_raw);
+}
+
+fn benchDecodeBlocks(iterations: u64, blocks: []const []const u8) u64 {
+    assert(iterations >= 1);
+    assert(blocks.len >= 1);
+    // `next() catch null` below ends the loop on an error, so a block that
+    // stopped decoding early would be timed as a shorter workload and reported
+    // as a faster one. Checked once, outside the loop.
+    assertBlocksDecodeWhole(blocks);
+
+    // The blocks are compile-time-known rodata, and the other rows here take
+    // the same precaution: a decode the optimizer can see through is a decode
+    // it can partly precompute.
+    var wire: [heavy_coded.len][]const u8 = undefined;
+    for (&wire, blocks) |*slot, block| slot.* = block;
+    std.mem.doNotOptimizeAway(&wire);
+
+    var checksum: u64 = 0;
+    var index: u64 = 0;
+    while (index < iterations) : (index += 1) {
+        var storage: hpack.DynamicTable.Storage(4096) = .{};
+        var decoder = hpack.Decoder.init(storage.table(), 64 * 1024);
+        for (wire) |block| {
+            var buffer: [16 * 1024]u8 = undefined;
+            var iterator = decoder.iterate(&buffer, block);
+            while (iterator.next() catch null) |field| {
+                checksum +%= field.name.len +% field.value.len;
+                std.mem.doNotOptimizeAway(checksum);
+            }
+        }
+    }
+    return checksum;
+}
+
+/// Every block decodes to the field count and octet count it was built from.
+///
+/// The coded and raw variants must agree on both, or the pair is measuring two
+/// different workloads and their ratio means nothing.
+fn assertBlocksDecodeWhole(blocks: []const []const u8) void {
+    var storage: hpack.DynamicTable.Storage(4096) = .{};
+    var decoder = hpack.Decoder.init(storage.table(), 64 * 1024);
+    var count: u32 = 0;
+    var octets: u64 = 0;
+    for (blocks) |block| {
+        var buffer: [16 * 1024]u8 = undefined;
+        var iterator = decoder.iterate(&buffer, block);
+        while (iterator.next() catch unreachable) |field| {
+            count += 1;
+            octets += field.name.len + field.value.len;
+        }
+    }
+    assert(count == heavy_request.len + heavy_response.len);
+    assert(octets == heavy_octets);
 }
 
 /// Encode every Appendix C header list, each story against a fresh context.
@@ -639,7 +826,7 @@ pub fn main(init: std.process.Init) !void {
 
     var results: [workloads.len]Result = undefined;
     for (&results, workloads) |*result, workload| {
-        result.* = measure(io, workload, runs, iterations);
+        result.* = measure(io, workload, runs, @max(1, iterations / workload.divisor));
     }
 
     report(&results, iterations);
@@ -672,6 +859,7 @@ fn measure(io: std.Io, workload: Workload, runs: u64, iterations: u64) Result {
 
     return .{
         .name = workload.name,
+        .iterations = iterations,
         .min_ns = min_ns,
         .mean_ns = @intCast(total_ns / runs),
         .max_ns = max_ns,
@@ -693,7 +881,7 @@ fn report(results: []const Result, iterations: u64) void {
             seconds(result.min_ns),
             seconds(result.mean_ns),
             seconds(result.max_ns),
-            nanosecondsPerOp(result.min_ns, iterations),
+            nanosecondsPerOp(result.min_ns, result.iterations),
         });
     }
     // Which build this was. The numbers move by tens of percent between the
