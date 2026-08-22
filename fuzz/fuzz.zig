@@ -238,6 +238,50 @@ fn fuzzHuffman(_: void, smith: *std.testing.Smith) !void {
     std.debug.assert(std.mem.eql(u8, reencoded[0..encoded_length], wire[0..length]));
 }
 
+test "fuzz: huffman kernels agree" {
+    try std.testing.fuzz({}, fuzzHuffmanAgreement, .{});
+}
+
+/// The twelve-bit window and the nibble automaton must be indistinguishable.
+///
+/// `decode` is the window and `decodeReference` is the automaton, and the whole
+/// case for shipping the faster one rests on their agreeing everywhere — not
+/// only on what they accept, but on which error they return and how much they
+/// wrote. The exhaustive test in `huffman.zig` covers every one- and two-octet
+/// input; this covers the shapes that need more octets to reach, which is where
+/// the escapes and the accumulator refill live.
+fn fuzzHuffmanAgreement(_: void, smith: *std.testing.Smith) !void {
+    var wire: [input_max]u8 = undefined;
+    const length = smith.slice(&wire);
+
+    var reference: [input_max * huffman_expansion_max]u8 = undefined;
+    var window: [input_max * huffman_expansion_max]u8 = undefined;
+    @memset(&reference, 0);
+    @memset(&window, 0);
+
+    // The capacity is drawn, not fixed. With a buffer that always fits, the
+    // only behavioural difference the two kernels can have — what each leaves
+    // in the target when it runs out of room mid-pair — is unreachable, and the
+    // window emits two symbols per lookup where the automaton emits one.
+    const capacity = @min(reference.len, smith.value(u16));
+
+    if (hpack.huffman.decodeReference(reference[0..capacity], wire[0..length])) |written| {
+        // Reachable only on the bug this target hunts: the automaton accepted
+        // and the window did not.
+        const other = hpack.huffman.decode(window[0..capacity], wire[0..length]) catch unreachable;
+        std.debug.assert(written == other);
+    } else |err| {
+        if (hpack.huffman.decode(window[0..capacity], wire[0..length])) |_| {
+            // The window accepted what the automaton rejected.
+            unreachable;
+        } else |other| {
+            std.debug.assert(err == other);
+        }
+    }
+    // Whatever each wrote, including on the error paths.
+    std.debug.assert(std.mem.eql(u8, reference[0..capacity], window[0..capacity]));
+}
+
 test "fuzz: huffman round trip" {
     try std.testing.fuzz({}, fuzzHuffmanRoundTrip, .{});
 }

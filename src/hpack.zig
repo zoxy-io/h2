@@ -4,6 +4,11 @@
 //! exposed because a consumer occasionally needs a piece on its own — zrk
 //! encodes one header block at startup and replays it forever, and reaches
 //! `huffman` directly to size the buffer it does that in.
+//!
+//! `huffman` exports two decoders, and `huffman.decode` is the one to call.
+//! `huffman.decodeReference` is the slower nibble automaton, kept as the oracle
+//! the faster one is tested against; it is public only so the benchmark and the
+//! fuzz targets can reach it from their own modules.
 
 const std = @import("std");
 

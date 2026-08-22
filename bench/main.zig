@@ -49,6 +49,9 @@ const workloads = [_]Workload{
     .{ .name = "hpack encode", .run = benchHpackEncode },
     .{ .name = "hpack encode static", .run = benchHpackEncodeStatic },
     .{ .name = "huffman decode", .run = benchHuffmanDecode },
+    .{ .name = "huffman decode ref", .run = benchHuffmanDecodeReference },
+    .{ .name = "huffman decode long", .run = benchHuffmanDecodeLong },
+    .{ .name = "huffman decode long ref", .run = benchHuffmanDecodeLongReference },
     .{ .name = "huffman encode", .run = benchHuffmanEncode },
 };
 
@@ -145,22 +148,66 @@ fn benchEncode(iterations: u64, mode: hpack.Encoder.Mode) u64 {
     return checksum;
 }
 
-/// The nibble automaton on its own, where a change to the table shows up
-/// undiluted by the representation layer above it.
+/// The Huffman kernel on its own, where a change to it shows up undiluted by
+/// the representation layer above.
 fn benchHuffmanDecode(iterations: u64) u64 {
+    return benchDecodeKernel(iterations, date_wire, .window);
+}
+
+/// The date header's wire form, lifted from the RFC's own vectors.
+const date_wire = blk: {
+    for (examples.huffman_strings) |vector| {
+        if (std.mem.eql(u8, vector.text, date_text)) break :blk vector.wire;
+    }
+    unreachable;
+};
+
+/// A long, realistic value: one set-cookie of the shape the RFC's own C.5.3
+/// uses, extended with the attributes a real one carries — 132 octets of text.
+const long_text = "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1; " ++
+    "path=/some/reasonably/long/path; domain=www.example.com; secure; httponly";
+
+const long_wire = blk: {
+    @setEvalBranchQuota(200_000);
+    var buffer: [512]u8 = undefined;
+    const length = hpack.huffman.encode(&buffer, long_text) catch unreachable;
+    break :blk buffer[0..length].*;
+};
+
+/// The retired nibble automaton on the same value, so the two numbers are a
+/// direct comparison on identical input.
+fn benchHuffmanDecodeReference(iterations: u64) u64 {
+    return benchDecodeKernel(iterations, date_wire, .automaton);
+}
+
+/// A longer value, where the per-call cost stops dominating.
+///
+/// A header value of twenty-nine octets is realistic and also short enough that
+/// setting up a bit reader is a visible fraction of the work. A cookie or a
+/// long location header is where a wider window is supposed to pay, so both
+/// lengths are measured rather than one.
+fn benchHuffmanDecodeLong(iterations: u64) u64 {
+    return benchDecodeKernel(iterations, &long_wire, .window);
+}
+
+fn benchHuffmanDecodeLongReference(iterations: u64) u64 {
+    return benchDecodeKernel(iterations, &long_wire, .automaton);
+}
+
+const Kernel = enum { window, automaton };
+
+fn benchDecodeKernel(iterations: u64, wire: []const u8, kernel: Kernel) u64 {
     assert(iterations >= 1);
-    const wire = comptime blk: {
-        for (examples.huffman_strings) |vector| {
-            if (std.mem.eql(u8, vector.text, date_text)) break :blk vector.wire;
-        }
-        unreachable;
-    };
     var checksum: u64 = 0;
     var index: u64 = 0;
     while (index < iterations) : (index += 1) {
-        var decoded: [64]u8 = undefined;
-        const written = hpack.huffman.decode(&decoded, wire) catch unreachable;
-        checksum +%= written;
+        var decoded: [1024]u8 = undefined;
+        const written = switch (kernel) {
+            .window => hpack.huffman.decode(&decoded, wire) catch unreachable,
+            .automaton => hpack.huffman.decodeReference(&decoded, wire) catch unreachable,
+        };
+        assert(written >= 1);
+        checksum +%= written +% decoded[0];
         std.mem.doNotOptimizeAway(checksum);
     }
     return checksum;
