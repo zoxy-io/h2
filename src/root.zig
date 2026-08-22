@@ -1,5 +1,5 @@
 //! h2 — HTTP/2 frame codec (RFC 9113 sections 4-6), HPACK (RFC 7541), and the
-//! field validity rules of RFC 9113 section 8.2.
+//! message-level rules of RFC 9113 section 8.
 //!
 //! Bytes in, frames and header fields out. Nothing here reads a socket or
 //! holds connection state: the two consumers do not share a runtime, so

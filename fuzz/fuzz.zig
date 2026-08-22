@@ -621,3 +621,280 @@ fn expectSameOutcome(comptime Set: type, reference: Set!void, kernel: Set!void) 
     const actual: ?Set = if (kernel) |_| null else |err| err;
     try std.testing.expectEqual(expected, actual);
 }
+
+/// Names drawn for the message-validator target: every pseudo-header including
+/// one that is never defined, both connection-specific spellings that matter
+/// most for a downgrade, `te`, and ordinary fields.
+const drawn_names = [_][]const u8{
+    ":method",   ":scheme", ":authority",        ":path",   ":status",
+    ":protocol", ":bogus",  "transfer-encoding", "upgrade", "connection",
+    "te",        "accept",  "cookie",            "host",    "x-forwarded-for",
+};
+
+/// Values chosen so that every rule keyed on a value is reachable at a useful
+/// rate — CONNECT and its case-sensitivity, an http-like scheme in both cases,
+/// an empty value, `te: trailers` in both cases.
+const drawn_values = [_][]const u8{
+    "GET",       "CONNECT",             "connect",   "OPTIONS",  "https",
+    "HTTPS",     "http",                "ftp",       "",         "/",
+    "*",         "200",                 "trailers",  "TRAILERS", "gzip",
+    "websocket", "www.example.com:443", "text/html",
+};
+
+/// Fields offered to one message validator. Short enough that a failing case is
+/// readable, long enough to reach a repeat of every pseudo-header.
+const message_fields_max: usize = 12;
+
+comptime {
+    // The "long enough" half of that sentence, which is a relation rather than
+    // a number: a block has to be able to carry every pseudo-header once and
+    // still have room to repeat one.
+    std.debug.assert(message_fields_max > std.enums.values(h2.fields.MessageValidator.Pseudo).len);
+}
+
+test "fuzz: message validator" {
+    try std.testing.fuzz({}, fuzzMessageValidator, .{});
+}
+
+/// A field block a validator accepts must actually satisfy RFC 9113 section
+/// 8.3, re-derived from the whole block rather than from the state machine.
+///
+/// The accept direction is the one checked, and the asymmetry is deliberate:
+/// accepting a malformed message is the security failure — it is the message
+/// that reaches an HTTP/1.1 upstream — while refusing a well-formed one is an
+/// interoperability bug that the unit tests in `MessageValidator.zig` cover
+/// case by case. Restating the reject direction here would mean writing the
+/// whole rule set a second time to prove a weaker property.
+///
+/// Reject-or-parse still holds regardless: the validator's own assertions are
+/// live in this build, so a state machine that reached an impossible state
+/// fails here whichever way it answered.
+fn fuzzMessageValidator(_: void, smith: *std.testing.Smith) !void {
+    const fields = h2.fields;
+
+    var block: [message_fields_max]h2.hpack.Field = undefined;
+    const count = smith.index(block.len + 1);
+    std.debug.assert(count <= block.len);
+    for (block[0..count]) |*offered| {
+        offered.* = .{
+            .name = drawn_names[smith.index(drawn_names.len)],
+            .value = drawn_values[smith.index(drawn_values.len)],
+        };
+    }
+
+    const options: fields.MessageValidator.Options = .{
+        .kind = smith.value(fields.MessageValidator.Kind),
+        .rules = smith.value(fields.syntax.Rules),
+        .extended_connect = smith.value(bool),
+    };
+
+    var validator: fields.MessageValidator = .init(options);
+    for (block[0..count]) |*offered| {
+        validator.field(offered) catch return;
+    }
+    validator.finish() catch return;
+
+    try expectWellFormed(options, block[0..count]);
+}
+
+/// The pseudo-header registry and its direction table, written out here rather
+/// than read from `MessageValidator`.
+///
+/// The first version of this oracle called `fields.isPseudo`, `Pseudo.name()`
+/// and `Pseudo.forRequest()` — the implementation's own tables — while its doc
+/// comment claimed to re-derive the rules. It did not: changing `forRequest` to
+/// `return true` makes the validator accept `:status` in a request, and that
+/// oracle would have agreed, because it asked the broken function.
+const oracle_pseudo = [_]struct { name: []const u8, request: bool }{
+    .{ .name = ":method", .request = true },
+    .{ .name = ":scheme", .request = true },
+    .{ .name = ":authority", .request = true },
+    .{ .name = ":path", .request = true },
+    .{ .name = ":protocol", .request = true },
+    .{ .name = ":status", .request = false },
+};
+
+/// RFC 9113 section 8.2.2's connection-specific fields, likewise written out.
+const oracle_connection_specific = [_][]const u8{
+    "connection", "proxy-connection", "keep-alive", "transfer-encoding", "upgrade",
+};
+
+/// Sections 8.3, 8.3.1, 8.3.2, 8.5, 8.2.2 and RFC 8441 section 4, checked over a
+/// block the validator accepted.
+fn expectWellFormed(
+    options: h2.fields.MessageValidator.Options,
+    block: []const h2.hpack.Field,
+) !void {
+    var seen = [_]bool{false} ** oracle_pseudo.len;
+    var regular_seen = false;
+    var connect = false;
+    var http_scheme = false;
+    var empty_path = false;
+
+    for (block) |offered| {
+        try std.testing.expect(offered.name.len >= 1);
+        if (offered.name[0] != ':') {
+            regular_seen = true;
+            // Section 8.2.2.
+            for (oracle_connection_specific) |forbidden| {
+                try std.testing.expect(!std.mem.eql(u8, offered.name, forbidden));
+            }
+            // Section 8.2.2's exception, which names a request and no other
+            // kind of block; RFC 5234 section 2.3 makes the value's spelling
+            // case-insensitive.
+            if (std.mem.eql(u8, offered.name, "te")) {
+                try std.testing.expect(options.kind == .request);
+                try std.testing.expect(std.ascii.eqlIgnoreCase(offered.value, "trailers"));
+            }
+            continue;
+        }
+
+        // Section 8.3: no pseudo-header after a regular field.
+        try std.testing.expect(!regular_seen);
+
+        var index: ?usize = null;
+        for (oracle_pseudo, 0..) |candidate, position| {
+            if (std.mem.eql(u8, offered.name, candidate.name)) index = position;
+        }
+        // Section 8.3: an undefined pseudo-header is malformed, so an accepted
+        // block cannot contain one.
+        const which = index orelse return error.TestUnexpectedResult;
+        // Section 8.3: "The same pseudo-header field name MUST NOT appear more
+        // than once in a field block."
+        try std.testing.expect(!seen[which]);
+        seen[which] = true;
+
+        // Section 8.3: each direction's own, and none at all in a trailer.
+        switch (options.kind) {
+            .trailer => return error.TestUnexpectedResult,
+            .request => try std.testing.expect(oracle_pseudo[which].request),
+            .response => try std.testing.expect(!oracle_pseudo[which].request),
+        }
+
+        // Section 8.3.1's "exactly one valid value", less `:path`, whose
+        // emptiness is the scheme's question.
+        if (!std.mem.eql(u8, offered.name, ":path")) {
+            try std.testing.expect(offered.value.len >= 1);
+        }
+
+        if (std.mem.eql(u8, offered.name, ":method")) {
+            // RFC 9110 section 9.1: the method token is case-sensitive.
+            connect = std.mem.eql(u8, offered.value, "CONNECT");
+        } else if (std.mem.eql(u8, offered.name, ":scheme")) {
+            // RFC 3986 section 3.1: schemes are not.
+            http_scheme = std.ascii.eqlIgnoreCase(offered.value, "http") or
+                std.ascii.eqlIgnoreCase(offered.value, "https");
+        } else if (std.mem.eql(u8, offered.name, ":path")) {
+            empty_path = offered.value.len == 0;
+        } else if (std.mem.eql(u8, offered.name, ":protocol")) {
+            // RFC 8441 section 4: negotiated, or it does not exist.
+            try std.testing.expect(options.extended_connect);
+        }
+    }
+
+    const extended = seen[indexOfPseudo(":protocol")];
+    switch (options.kind) {
+        .trailer => {},
+        // Section 8.3.2.
+        .response => try std.testing.expect(seen[indexOfPseudo(":status")]),
+        .request => if (extended) {
+            // RFC 8441 section 4: ":protocol" rides on CONNECT, and requires
+            // the ":scheme" and ":path" that plain CONNECT forbids.
+            try std.testing.expect(connect);
+            try std.testing.expect(seen[indexOfPseudo(":scheme")]);
+            try std.testing.expect(seen[indexOfPseudo(":path")]);
+            try std.testing.expect(!(http_scheme and empty_path));
+        } else if (connect) {
+            // Section 8.5.
+            try std.testing.expect(!seen[indexOfPseudo(":scheme")]);
+            try std.testing.expect(!seen[indexOfPseudo(":path")]);
+            try std.testing.expect(seen[indexOfPseudo(":authority")]);
+        } else {
+            // Section 8.3.1.
+            try std.testing.expect(seen[indexOfPseudo(":method")]);
+            try std.testing.expect(seen[indexOfPseudo(":scheme")]);
+            try std.testing.expect(seen[indexOfPseudo(":path")]);
+            try std.testing.expect(!(http_scheme and empty_path));
+        },
+    }
+}
+
+/// The position of a pseudo-header in `oracle_pseudo`, resolved at compile
+/// time so a name that is not in the table is a build failure rather than a
+/// test that quietly checks the wrong slot.
+fn indexOfPseudo(comptime name: []const u8) usize {
+    return comptime blk: {
+        for (oracle_pseudo, 0..) |candidate, position| {
+            if (std.mem.eql(u8, candidate.name, name)) break :blk position;
+        }
+        unreachable;
+    };
+}
+
+test "the message oracle refuses what a broken validator would accept" {
+    // The oracle above is only worth having if it disagrees with a wrong
+    // validator, and its first version did not: it called the implementation's
+    // own registry and direction table, so any bug in those was invisible to
+    // it. These three blocks are the three defect classes that review found —
+    // each is malformed, each would be accepted by a plausible break in the
+    // validator, and the oracle must refuse each on its own tables.
+    //
+    // Pinned deterministically rather than left to the fuzz target. Reaching
+    // any of them by drawing needs a block that is well-formed in every other
+    // respect, which is a narrow target in a fifteen-by-eighteen name and value
+    // space — ninety seconds of coverage-guided fuzzing did not find the first
+    // one. A fuzzer that cannot reach a case does not test it.
+    const request: h2.fields.MessageValidator.Options =
+        .{ .kind = .request, .rules = .strict };
+    const extended: h2.fields.MessageValidator.Options =
+        .{ .kind = .request, .rules = .strict, .extended_connect = true };
+
+    // Section 8.3: a response's pseudo-header in a request. Accepted if
+    // `Pseudo.forRequest` returned true for everything.
+    try expectOracleRefuses(request, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":status", .value = "200" },
+    });
+
+    // RFC 8441 section 4: extended CONNECT without the `:scheme` and `:path` it
+    // requires. Accepted if section 8.5's rules were read first.
+    try expectOracleRefuses(extended, &.{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":protocol", .value = "websocket" },
+    });
+
+    // Section 8.3.1 with RFC 3986 section 3.1: an empty `:path` under a scheme
+    // spelled in uppercase. Accepted if the scheme comparison were
+    // case-sensitive.
+    try expectOracleRefuses(request, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "HTTPS" },
+        .{ .name = ":path", .value = "" },
+    });
+}
+
+/// Both halves: the validator rejects the block today, and the oracle would
+/// reject it even if the validator stopped.
+fn expectOracleRefuses(
+    options: h2.fields.MessageValidator.Options,
+    block: []const h2.hpack.Field,
+) !void {
+    var validator: h2.fields.MessageValidator = .init(options);
+    var rejected = false;
+    for (block) |*offered| {
+        validator.field(offered) catch {
+            rejected = true;
+            break;
+        };
+    }
+    if (!rejected) {
+        validator.finish() catch {
+            rejected = true;
+        };
+    }
+    try std.testing.expect(rejected);
+    try std.testing.expectError(error.TestUnexpectedResult, expectWellFormed(options, block));
+}

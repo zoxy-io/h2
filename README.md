@@ -12,10 +12,12 @@ HTTP/2 frame codec, HPACK, and field validation.
 
 * **RFC 9113 frame codec** — framing only, not the connection state machine.
 * **RFC 7541 HPACK** — encoder, decoder, Huffman, static and dynamic tables.
-* **RFC 9113 §8.2 field validation** — the octet rules that make an HTTP/2
-  message well-formed, and the downgrade guard against request smuggling. A
-  check, never an enforcement: what to do about a malformed field is the
-  consumer's decision, and the two consumers answer differently.
+* **RFC 9113 §8.2 and §8.3 message validation** — the octet rules for field
+  names and values, and the pseudo-header rules that make a request or response
+  well-formed. Between them they are the guard against request smuggling
+  through an HTTP/1.1 downgrade. A check, never an enforcement: what to do
+  about a malformed message is the consumer's decision, and the two consumers
+  answer differently.
 
 Out of scope, permanently: sockets, TLS, ALPN, flow control policy, stream
 scheduling, and the connection state machine. Those differ per consumer and

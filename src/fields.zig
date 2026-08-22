@@ -1,4 +1,5 @@
-//! RFC 9113 section 8.2: what a field name and value may contain.
+//! RFC 9113 section 8.2: what a field name and value may contain, and section
+//! 8.3: which pseudo-header fields may appear where.
 //!
 //! This is not framing and it is not HPACK, which is why it is a third module
 //! rather than a corner of one of the other two. HPACK will carry any octets at
@@ -19,18 +20,18 @@
 //! That is the same boundary the frame codec draws for `PUSH_PROMISE`: parse
 //! and render, and say nothing about who should refuse what.
 //!
-//! ## Not here yet
+//! ## Two shapes, because there are two kinds of question
 //!
-//! Section 8.3 — which pseudo-header fields are defined for a request and which
-//! for a response, that they precede every ordinary field, that none repeats,
-//! and which are mandatory — is a separate slice. It needs state across a whole
-//! field block where everything here is a pure function of one string, so it
-//! will arrive as its own type rather than as more functions in this file.
+//! `validateName` and `validateValue` are pure functions of one string, and a
+//! consumer can call either on its own. `MessageValidator` is fed a whole field
+//! block one field at a time, because section 8.3's rules are about position
+//! and repetition and so need to remember what came before.
 
 const std = @import("std");
 
 const Field = @import("hpack/Field.zig");
 
+pub const MessageValidator = @import("fields/MessageValidator.zig");
 pub const syntax = @import("fields/syntax.zig");
 
 pub const Rules = syntax.Rules;
@@ -61,14 +62,14 @@ pub fn validate(field: *const Field, rules: Rules) FieldError!void {
 
 /// Whether a name is a pseudo-header field's (section 8.3): it begins with a
 /// colon. Says nothing about whether it is one this document defines, or
-/// whether it is allowed where it appeared. Both of those are section 8.3
-/// questions about a whole field block, and neither is answered in this
-/// package yet.
+/// whether it is allowed where it appeared — `MessageValidator` answers both,
+/// because both are questions about the field block rather than the name.
 pub fn isPseudo(name: []const u8) bool {
     return name.len > 0 and name[0] == syntax.pseudo_prefix;
 }
 
 test {
+    _ = MessageValidator;
     _ = syntax;
 }
 

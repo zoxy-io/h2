@@ -62,6 +62,7 @@ const workloads = [_]Workload{
     .{ .name = "field block validate ref", .run = benchFieldBlockValidateReference },
     .{ .name = "field value long", .run = benchFieldValueLong },
     .{ .name = "field value long ref", .run = benchFieldValueLongReference },
+    .{ .name = "message validate", .run = benchMessageValidate },
 };
 
 const Workload = struct {
@@ -511,6 +512,22 @@ const Block = struct {
         }
         assert(cursor == request_text_octets);
         std.mem.doNotOptimizeAway(&block.storage);
+        block.assertWellFormed();
+    }
+
+    /// The block has to be one every workload *accepts*.
+    ///
+    /// `outcome` turns a rejection into a number rather than a crash, which is
+    /// what keeps the optimizer honest — and would also let a block that fails
+    /// section 8.3 be timed on the error path while the table reported it as
+    /// the cost of validating a request. Checked once at setup, outside the
+    /// timing loop.
+    fn assertWellFormed(block: *const Block) void {
+        var validator: fields.MessageValidator = .init(.{ .kind = .request, .rules = .strict });
+        for (block.names, block.values) |name, value| {
+            validator.field(&.{ .name = name, .value = value }) catch unreachable;
+        }
+        validator.finish() catch unreachable;
     }
 };
 
@@ -530,6 +547,41 @@ fn benchFieldValidate(iterations: u64, validator: Validator) u64 {
                     outcome(fields.syntax.validateValueReference(value, .strict)),
             };
         }
+        std.mem.doNotOptimizeAway(checksum);
+    }
+    return checksum;
+}
+
+/// A whole request block through `MessageValidator`: the octet rules of section
+/// 8.2.1 plus the message rules of sections 8.2.2 and 8.3, which is what a
+/// consumer actually pays per request.
+///
+/// Read it against `field block validate`, which is the same fourteen fields
+/// through the octet rules alone. The difference is what sections 8.2.2 and 8.3
+/// cost — a name lookup and a bitset per field, on top of a sweep that had to
+/// happen anyway.
+///
+/// A measured caution about this number. It moved from 165 to 198 ns/op when
+/// `Block.init` started calling `MessageValidator.field` too, and the call is
+/// outside the timing loop: with exactly one caller, LLVM specialized `field`
+/// into the loop, and a second caller stopped it. 198 is the honest figure —
+/// a consumer validating requests calls `field` from more than one place, so it
+/// does not get that specialization either. The lesson generalizes past this
+/// workload: a microbenchmark that is a function's only caller is measuring a
+/// version of it that nothing else will ever run.
+fn benchMessageValidate(iterations: u64) u64 {
+    assert(iterations >= 1);
+    var block: Block = undefined;
+    block.init();
+
+    var checksum: u64 = 0;
+    var index: u64 = 0;
+    while (index < iterations) : (index += 1) {
+        var validator: fields.MessageValidator = .init(.{ .kind = .request, .rules = .strict });
+        for (block.names, block.values) |name, value| {
+            checksum +%= outcome(validator.field(&.{ .name = name, .value = value }));
+        }
+        checksum +%= outcome(validator.finish());
         std.mem.doNotOptimizeAway(checksum);
     }
     return checksum;

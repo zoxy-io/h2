@@ -118,7 +118,7 @@ pub const pseudo_prefix: u8 = ':';
 /// which is what makes `:method` legal and `x:y` and `::method` not. Whether a
 /// pseudo-header is *allowed here* — the direction it is defined for, whether a
 /// trailer section may carry one — is a question about the message and not
-/// about these octets; `MessageValidator` answers it.
+/// about these octets, and `MessageValidator` answers it.
 pub fn validateName(name: []const u8, rules: Rules) NameError!void {
     if (name.len == 0) return error.Empty;
     const body = if (name[0] == pseudo_prefix) name[1..] else name;
