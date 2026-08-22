@@ -35,10 +35,19 @@ They do not share a runtime, which is why the API is bytes in, frames and
 header fields out: a reader or writer in the seam would exclude one of them.
 `zig build lint` enforces it.
 
+## Gates
+
+```sh
+zig build ci      # tests, the lint's own tests, the fuzz corpus, the boundary lint
+zig build bench   # decode/encode microbenchmarks (ReleaseFast)
+zig build fuzz    # replay the corpus; --fuzz to actually fuzz
+```
+
 ## Style
 
 [`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md) — zoxy's TigerStyle, plus the
-deltas a shared library forces.
+deltas a shared library forces. [`CLAUDE.md`](CLAUDE.md) carries the same rules
+as working instructions, including the review and benchmark gates.
 
 ## Context
 

@@ -63,6 +63,37 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Run the fuzz harness (pass --fuzz to actually fuzz)");
     fuzz_step.dependOn(&fuzz_run.step);
 
+    // The performance gate. ReleaseFast is hardcoded rather than offered:
+    // `standardOptimizeOption`'s `preferred_optimize_mode` still yields Debug
+    // unless `-Drelease` is passed, and a benchmark built in Debug reports
+    // numbers that mean nothing. See bench/main.zig for the other footgun.
+    const bench_runs = b.option(u64, "runs", "Repetitions per workload (default 5)") orelse 5;
+    const bench_iterations = b.option(u64, "iterations", "Units of work per run (default 1_000_000)") orelse 1_000_000;
+    const bench_options = b.addOptions();
+    bench_options.addOption(u64, "runs", bench_runs);
+    bench_options.addOption(u64, "iterations", bench_iterations);
+
+    const bench_exe = b.addExecutable(.{
+        .name = "h2-bench",
+        // Zig 0.16's self-hosted x86_64 backend scalarizes `@Vector` code, and
+        // HPACK's Huffman decode is exactly the kind of work that would
+        // silently lose an order of magnitude without this.
+        .use_llvm = true,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "h2", .module = h2_module },
+                .{ .name = "bench_options", .module = bench_options.createModule() },
+            },
+        }),
+    });
+    const bench_run = b.addRunArtifact(bench_exe);
+    if (b.args) |args| bench_run.addArgs(args);
+    const bench_step = b.step("bench", "Run the decode/encode microbenchmarks (ReleaseFast)");
+    bench_step.dependOn(&bench_run.step);
+
     const test_step = b.step("test", "Run unit tests, the lint's own tests, and the fuzz corpus");
     test_step.dependOn(&module_tests.step);
     test_step.dependOn(&lint_tests.step);
@@ -70,8 +101,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&fuzz_run.step);
 
     // Every per-change gate behind one name, so CI and a local check cannot
-    // drift apart.
-    const ci_step = b.step("ci", "Per-change gates: test + lint");
+    // drift apart. `bench` is deliberately excluded: its verdict is a band
+    // comparison a human makes across runs, not a pass/fail a shared runner
+    // can produce. CLAUDE.md requires it by hand for a change that touches a
+    // decode or encode path.
+    const ci_step = b.step("ci", "Per-change gates: test + lint (bench is run by hand)");
     ci_step.dependOn(test_step);
     ci_step.dependOn(lint_step);
 }
