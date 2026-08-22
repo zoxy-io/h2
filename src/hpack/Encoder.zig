@@ -468,11 +468,14 @@ const Want = enum { name_only, name_and_value };
 /// The newest live entry whose hash matches, confirmed by a real comparison.
 ///
 /// Newest first, so the smallest index wins: a nearer entry encodes in fewer
-/// octets and has longer left before eviction. The walk is by position and
-/// converts to a slot per step, which is a modulo — the slots it touches are
-/// consecutive with at most one wrap, but the loop does not exploit that. If a
-/// vectorized scan is ever worth it, walking the one or two contiguous slot
-/// runs directly is where it would start.
+/// octets and has longer left before eviction.
+///
+/// Walked as one or two contiguous runs of slots rather than position by
+/// position. `slotOf` is a modulo, and paying one per candidate to read an
+/// array whose live span is already contiguous is work the shape of the data
+/// does not require — the ring wraps at most once, so the live slots are
+/// `[newest, entries)` followed by `[0, remainder)`. A strided read is also
+/// something no compiler will turn into a vector load, and a contiguous one is.
 fn scan(
     encoder: *const Encoder,
     hashes: []const u32,
@@ -486,19 +489,151 @@ fn scan(
     assert(count <= entries_count);
     assert(hashes.len >= entries_count);
 
+    const newest = encoder.table.newest;
+    assert(newest < entries_count);
+
+    // Below one vector there is nothing to vectorize, and splitting the live
+    // span into runs to discover that costs more than the walk it replaces.
+    // Measured: without this, a table of three or four entries — which is what
+    // the RFC's own examples keep, and what a connection has just after its
+    // first request — encoded about 2% slower.
+    if (count < scan_lanes) return encoder.scanStrided(hashes, wanted, field, want);
+
+    // Position zero is the newest, and the run from it reaches either the end
+    // of the live span or the end of the array, whichever comes first.
+    const leading_count = @min(count, entries_count - newest);
+    assert(leading_count >= 1);
+    assert(leading_count <= count);
+    if (encoder.scanRun(hashes[newest..][0..leading_count], wanted, field, want, 0)) |position| {
+        return position;
+    }
+    if (leading_count == count) return null;
+
+    // The wrapped remainder, which starts at slot zero by construction. Its
+    // first entry's *position* is the leading run's *count*, which holds only
+    // because positions are dense from zero — a count standing in for a
+    // position is worth saying out loud rather than leaving to arithmetic.
+    const trailing_count = count - leading_count;
+    assert(trailing_count < entries_count);
+    assert(newest + leading_count == entries_count);
+    return encoder.scanRun(hashes[0..trailing_count], wanted, field, want, leading_count);
+}
+
+/// One contiguous run of slots, whose first entry is `position_begin` places
+/// back from the newest.
+///
+/// Eight hashes per compare. The whole live span of a 4 KiB table is 512 octets
+/// — two cache lines — and a hash mismatch is the overwhelmingly common case, so
+/// the loop's job is to reject as many as possible per instruction and only
+/// then confirm.
+fn scanRun(
+    encoder: *const Encoder,
+    run: []const u32,
+    wanted: u32,
+    field: Field,
+    want: Want,
+    position_begin: u32,
+) ?u32 {
+    assert(run.len <= encoder.table.entries.len);
+    // The invariant a wrong run start breaks, stated where every call checks
+    // it. `confirm` would catch it too, but only on a hash hit — a bad start
+    // that lands on mismatching hashes returns null and says nothing.
+    assert(position_begin + run.len <= encoder.table.count);
+
+    const wanted_lanes: @Vector(scan_lanes, u32) = @splat(wanted);
+    var offset: usize = 0;
+    // Subtraction rather than `offset + scan_lanes <= run.len`: the sum is what
+    // would overflow, and a bound that can overflow before it is compared is
+    // not a bound.
+    while (run.len - offset >= scan_lanes) : (offset += scan_lanes) {
+        const chunk: @Vector(scan_lanes, u32) = run[offset..][0..scan_lanes].*;
+        const hits = chunk == wanted_lanes;
+        if (!@reduce(.Or, hits)) continue;
+        // Lanes in order, because the newest match is the one to return and
+        // lane order is position order.
+        inline for (0..scan_lanes) |lane| {
+            if (hits[lane]) {
+                if (encoder.confirm(field, want, position_begin + @as(u32, @intCast(offset + lane)))) |position| {
+                    return position;
+                }
+            }
+        }
+    }
+
+    assert(run.len - offset < scan_lanes);
+    while (offset < run.len) : (offset += 1) {
+        if (run[offset] != wanted) continue;
+        if (encoder.confirm(field, want, position_begin + @as(u32, @intCast(offset)))) |position| {
+            return position;
+        }
+    }
+    return null;
+}
+
+/// The straight walk: one slot per position, newest first.
+///
+/// `scan` uses it for a live span too short to fill a vector, and the tests use
+/// it as the reference the vector path must agree with.
+///
+/// `slotOf` is a modulo, and it is not the cost it looks like: the position
+/// advances by one, so the compiler strength-reduces it to a compare and a
+/// subtract. Replacing it with contiguous-run arithmetic measured *slower* on
+/// its own, and is worth having only because it is what lets the run above be
+/// a vector load.
+fn scanStrided(
+    encoder: *const Encoder,
+    hashes: []const u32,
+    wanted: u32,
+    field: Field,
+    want: Want,
+) ?u32 {
+    const count = encoder.table.count;
+    // No threshold asserted here on purpose. `scan` decides when to call this
+    // rather than the vector path, but the walk itself is correct for any
+    // count — which is what lets a test use it as the reference the vector path
+    // is checked against, on a table large enough that `scan` would not have
+    // chosen it.
+    assert(count <= encoder.table.entries.len);
     var position: u32 = 0;
     while (position < count) : (position += 1) {
         const slot = encoder.table.slotOf(position);
-        assert(slot < entries_count);
+        assert(slot < encoder.table.entries.len);
         if (hashes[slot] != wanted) continue;
-
-        // A hash hit is a candidate, not an answer.
-        const entry = encoder.table.get(position).?;
-        if (!std.mem.eql(u8, entry.name, field.name)) continue;
-        if (want == .name_and_value and !std.mem.eql(u8, entry.value, field.value)) continue;
-        return position;
+        if (encoder.confirm(field, want, position)) |found| return found;
     }
     return null;
+}
+
+/// Hashes compared per chunk: 32 octets, which is one 256-bit vector where
+/// there is one and two 128-bit registers where there is not. On the arm64 this
+/// was measured on it lowers to a pair of `ldp`-loaded `q` registers and two
+/// `cmeq.4s`, and the per-chunk cost is dominated by the horizontal reduction
+/// rather than by the compares — which is why the win is a little under half
+/// the scan rather than anything near eightfold.
+///
+/// Sixteen was tried on that reasoning, since halving the chunks halves the
+/// reductions, and measured slower: a realistic table holds forty-odd entries,
+/// so sixteen lanes leaves a fifteen-element scalar tail where eight leaves
+/// seven. The tail is the thing to keep small at these lengths.
+const scan_lanes: u32 = 8;
+
+comptime {
+    assert(scan_lanes >= 1);
+    // A run is at most the whole entry array, so the largest table this package
+    // can hold is the neighbour worth relating to. There is deliberately no
+    // lower relation: `entriesRequired(0)` is zero and a table that small is
+    // legal, which `scan` handles by taking the strided walk rather than by
+    // forming a run at all.
+    assert(scan_lanes <= DynamicTable.entriesRequired(DynamicTable.capacity_max));
+}
+
+/// A hash hit is a candidate, not an answer.
+fn confirm(encoder: *const Encoder, field: Field, want: Want, position: u32) ?u32 {
+    assert(position < encoder.table.count);
+    const entry = encoder.table.get(position).?;
+    if (!std.mem.eql(u8, entry.name, field.name)) return null;
+    if (want == .name_and_value and !std.mem.eql(u8, entry.value, field.value)) return null;
+    return position;
 }
 
 fn insert(encoder: *Encoder, field: Field) void {
@@ -888,4 +1023,177 @@ test "an oversized field clears both tables in step" {
 
     try testing.expectEqual(@as(u32, 0), encoder.table.count);
     try testing.expectEqual(@as(u32, 0), decoder.table.count);
+}
+
+test "the vectorized scan finds the same entry a strided walk would, across the wrap" {
+    // The path this test exists for is reached only when at least `scan_lanes`
+    // entries are live, and only crosses the ring's wrap when the live span
+    // straddles the end of the array. Neither holds for the RFC's examples or
+    // the vendored corpus, which keep tables of three or four entries — so
+    // before this test, an off-by-one in the trailing run's start passed every
+    // gate in the package. Verified by introducing one.
+    var storage: Storage(1024) = .{};
+    var encoder = storage.encoder(.dynamic);
+    var target: [4096]u8 = undefined;
+
+    // Enough distinct fields that `newest` has wrapped past the end of the
+    // entry array and come back around.
+    var index: u32 = 0;
+    while (index < 200) : (index += 1) {
+        var name_buffer: [16]u8 = undefined;
+        var value_buffer: [24]u8 = undefined;
+        const field: Field = .{
+            .name = try std.fmt.bufPrint(&name_buffer, "x-probe-{d:0>4}", .{index}),
+            .value = try std.fmt.bufPrint(&value_buffer, "value-{d:0>6}-pad", .{index}),
+        };
+        _ = try encoder.encodeField(&target, field);
+    }
+
+    const entries_count: u32 = @intCast(encoder.table.entries.len);
+    const count = encoder.table.count;
+    // The test is only testing what it claims if both hold.
+    try std.testing.expect(count >= scan_lanes);
+    try std.testing.expect(encoder.table.newest + count > entries_count);
+
+    // Every live entry must be found at its own position. A run start that is
+    // off by one returns a position whose entry is a *different* field, which
+    // encodes a reference the peer resolves to the wrong header — a compression
+    // bug rather than a crash, and invisible to a round-trip that re-encodes
+    // and re-decodes with the same wrong table.
+    var position: u32 = 0;
+    while (position < count) : (position += 1) {
+        const entry = encoder.table.get(position).?;
+        // Copied out before `encodeField` sees them. `get` returns slices into
+        // the arena, and if the scan regressed, `encodeField` would fall
+        // through to a literal and insert them — where the only guard against
+        // aliasing is `DynamicTable.insert`'s assertion. Under
+        // `-Dassertions=false` that is a `@memcpy` from a region `compact` may
+        // just have moved, so this test's failure mode would be undefined
+        // behaviour in the one CI leg built to catch it.
+        var name_copy: [64]u8 = undefined;
+        var value_copy: [64]u8 = undefined;
+        @memcpy(name_copy[0..entry.name.len], entry.name);
+        @memcpy(value_copy[0..entry.value.len], entry.value);
+        const field: Field = .{
+            .name = name_copy[0..entry.name.len],
+            .value = value_copy[0..entry.value.len],
+        };
+
+        const written = try encoder.encodeField(&target, field);
+        // A regression would insert rather than index, moving the table under
+        // every later iteration. Caught here rather than as a confusing failure
+        // three positions later.
+        try std.testing.expectEqual(count, encoder.table.count);
+        // A full match is one indexed representation and nothing else.
+        try std.testing.expect(written >= 1);
+        try std.testing.expect(target[0] & 0b1000_0000 != 0);
+
+        const decoded = try integer.decode(target[0..written], prefix_indexed);
+        try std.testing.expectEqual(written, decoded.octets);
+        try std.testing.expectEqual(encoder.wireIndex(position), decoded.value);
+
+        // And the index really does name this entry, not merely some entry.
+        const found = decoded.value - static_table.dynamic_offset;
+        const same = encoder.table.get(found).?;
+        try std.testing.expectEqualStrings(entry.name, same.name);
+        try std.testing.expectEqualStrings(entry.value, same.value);
+    }
+}
+
+test "the strided and vectorized scans agree on the same table" {
+    // The two implementations differ only by a count threshold, so the same
+    // table has to give the same answer through either. `scan` picks by
+    // `count`; this calls both directly on a table large enough for the vector
+    // path, which is the comparison the threshold hides.
+    var storage: Storage(1024) = .{};
+    var encoder = storage.encoder(.dynamic);
+    var target: [4096]u8 = undefined;
+
+    var index: u32 = 0;
+    while (index < 200) : (index += 1) {
+        var name_buffer: [16]u8 = undefined;
+        var value_buffer: [24]u8 = undefined;
+        _ = try encoder.encodeField(&target, .{
+            .name = try std.fmt.bufPrint(&name_buffer, "x-probe-{d:0>4}", .{index}),
+            .value = try std.fmt.bufPrint(&value_buffer, "value-{d:0>6}-pad", .{index}),
+        });
+    }
+    try std.testing.expect(encoder.table.count >= scan_lanes);
+
+    var position: u32 = 0;
+    while (position < encoder.table.count) : (position += 1) {
+        const entry = encoder.table.get(position).?;
+        const field: Field = .{ .name = entry.name, .value = entry.value };
+        const wanted = hashField(field.name, field.value);
+        const vectorized = encoder.scan(encoder.field_hashes, wanted, field, .name_and_value);
+        const strided = encoder.scanStrided(encoder.field_hashes, wanted, field, .name_and_value);
+        try std.testing.expectEqual(strided, vectorized);
+        try std.testing.expectEqual(position, vectorized.?);
+    }
+
+    // And a field in neither, which is the case that walks every live slot.
+    const absent: Field = .{ .name = "x-absent", .value = "nothing" };
+    const wanted_absent = hashField(absent.name, absent.value);
+    try std.testing.expectEqual(
+        encoder.scanStrided(encoder.field_hashes, wanted_absent, absent, .name_and_value),
+        encoder.scan(encoder.field_hashes, wanted_absent, absent, .name_and_value),
+    );
+}
+
+test "a name matched by several entries resolves to the newest of them" {
+    // `scan` promises "the newest live entry whose hash matches", and for a
+    // name that is not a correctness question but a compression one: any entry
+    // with the right name encodes correctly, and the newest encodes in the
+    // fewest octets. Duplicate *field* hashes cannot arise — a full match is
+    // found before an insert — but duplicate *name* hashes arise the moment a
+    // header is sent twice with different values, which is `set-cookie` on
+    // every response that sets two.
+    //
+    // The vector path tests eight lanes at once, so this is also what pins lane
+    // order: with several matches inside one chunk, reversing the lanes returns
+    // an older entry and a larger index. Nothing else in the package notices.
+    var storage: Storage(1024) = .{};
+    var encoder = storage.encoder(.dynamic);
+    var target: [4096]u8 = undefined;
+
+    // Enough distinct fields that the vector path is the one taken.
+    var index: u32 = 0;
+    while (index < 12) : (index += 1) {
+        var name_buffer: [16]u8 = undefined;
+        _ = try encoder.encodeField(&target, .{
+            .name = try std.fmt.bufPrint(&name_buffer, "x-filler-{d:0>3}", .{index}),
+            .value = "filler-value",
+        });
+    }
+
+    // Then the same name several times over, close enough together to share a
+    // chunk with each other.
+    var repeat: u32 = 0;
+    while (repeat < 4) : (repeat += 1) {
+        var value_buffer: [16]u8 = undefined;
+        _ = try encoder.encodeField(&target, .{
+            .name = "x-repeated",
+            .value = try std.fmt.bufPrint(&value_buffer, "value-{d}", .{repeat}),
+        });
+    }
+    try std.testing.expect(encoder.table.count >= scan_lanes);
+
+    // Position zero is the last one inserted, so it is the newest match and the
+    // one both scans must name.
+    const probe: Field = .{ .name = "x-repeated", .value = "not-in-the-table" };
+    const wanted = hashName(probe.name);
+    const vectorized = encoder.scan(encoder.name_hashes, wanted, probe, .name_only);
+    const strided = encoder.scanStrided(encoder.name_hashes, wanted, probe, .name_only);
+    try std.testing.expectEqual(@as(?u32, 0), vectorized);
+    try std.testing.expectEqual(strided, vectorized);
+
+    // And there really were several to choose between, or this test proves
+    // nothing about ordering.
+    var matches: u32 = 0;
+    var position: u32 = 0;
+    while (position < encoder.table.count) : (position += 1) {
+        const entry = encoder.table.get(position).?;
+        if (std.mem.eql(u8, entry.name, "x-repeated")) matches += 1;
+    }
+    try std.testing.expect(matches >= 4);
 }

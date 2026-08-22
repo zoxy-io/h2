@@ -159,6 +159,11 @@ const workloads = [_]Workload{
     .{ .name = "hpack decode heavy raw", .run = benchHpackDecodeHeavyRaw, .divisor = 100 },
     .{ .name = "hpack encode", .run = benchHpackEncode },
     .{ .name = "hpack encode static", .run = benchHpackEncodeStatic },
+    .{ .name = "hpack encode table miss", .run = benchEncodeTableMiss },
+    .{ .name = "hpack encode table hit", .run = benchEncodeTableHit },
+    .{ .name = "hpack encode table small", .run = benchEncodeTableSmall },
+    .{ .name = "hpack encode table 1k", .run = benchEncodeTable1k },
+    .{ .name = "hpack encode table 2k", .run = benchEncodeTable2k },
     .{ .name = "huffman decode", .run = benchHuffmanDecode },
     .{ .name = "huffman decode ref", .run = benchHuffmanDecodeReference },
     .{ .name = "huffman decode long", .run = benchHuffmanDecodeLong },
@@ -525,6 +530,142 @@ fn benchHpackEncodeStatic(iterations: u64) u64 {
 /// The body of both, which differ only in mode. Kept in one place so the two
 /// numbers stay comparable: a change to one that missed the other would look
 /// like a result.
+/// A dynamic table saturated with distinct fields, and a field that misses it.
+///
+/// Issue #5 exists because `zig build bench` could not ask this. The Appendix C
+/// stories keep tables of three or four entries, so the encode rows above never
+/// scan more than a handful — and a miss against a full table is the case the
+/// scan is written for: `lookup` walks `field_hashes` end to end, fails, then
+/// walks `name_hashes` end to end.
+///
+/// Note what "saturated" means in practice. `entriesRequired` allows 128 slots
+/// at 4 KiB because an entry cannot cost less than RFC 7541 section 4.1's 32
+/// octets of assumed overhead — but 128 live entries would need every name and
+/// value to be empty. Fields of a realistic size fill the same 4 KiB with about
+/// half that, and the count is asserted below so the row cannot quietly become
+/// a short-scan workload.
+const churn_fields = blk: {
+    @setEvalBranchQuota(200_000);
+    var generated: [churn_count]hpack.Field = undefined;
+    for (&generated, 0..) |*field, index| {
+        field.* = .{
+            // High-cardinality request headers, which is what actually defeats
+            // a dynamic table in front of a proxy.
+            .name = std.fmt.comptimePrint("x-request-context-{d:0>3}", .{index}),
+            .value = std.fmt.comptimePrint("{x:0>16}-{x:0>16}", .{
+                index *% 2654435761,
+                index *% 40503 +% 0x9e3779b9,
+            }),
+        };
+    }
+    break :blk generated;
+};
+
+/// Distinct fields in the churn pool.
+///
+/// Comfortably more than the table holds, so that by the time the loop returns
+/// to a field its entry has long since been evicted and the encode is a miss
+/// again. A pool the size of the table would turn every second pass into a hit
+/// and measure something else.
+const churn_count = 192;
+
+/// The live entries the pool actually leaves in a 4 KiB table, checked rather
+/// than assumed: a change to the field shapes above that halved the scan length
+/// would otherwise be invisible.
+const churn_entries_min = 40;
+
+/// `Encoder.scan_lanes`, which is private. Repeated here only so the rows can
+/// assert which path they time; a mismatch shows up as a failing assert on the
+/// row that changed sides, which is the outcome worth having.
+const scan_lanes_bench = 8;
+
+fn benchEncodeTableMiss(iterations: u64) u64 {
+    return benchEncodeTable(iterations, .miss, 4096);
+}
+
+fn benchEncodeTableHit(iterations: u64) u64 {
+    return benchEncodeTable(iterations, .hit, 4096);
+}
+
+/// The same misses against a table too small to vectorize.
+///
+/// Two entries, not three: the churn field is 21 + 33 + 32 = 86 octets, so 256
+/// octets holds two. That is under one vector, so this row takes the *strided*
+/// walk — the code the vectorized scan did not touch.
+///
+/// Which makes it the negative control, and the most useful row in the set. It
+/// runs the identical field sequence through the identical encoder along
+/// unchanged code; if it moved when `table miss` moved, the difference would be
+/// alignment or layout luck from recompiling rather than the scan. It does not
+/// move.
+///
+/// It is therefore *not* a point on the size series below. The scan's cost per
+/// live entry is linear across 1k, 2k and 4k, which all take the vector path;
+/// reading this row as a fourth point averages across a code-path switch.
+fn benchEncodeTableSmall(iterations: u64) u64 {
+    return benchEncodeTable(iterations, .miss, 256);
+}
+
+/// Two more sizes, so the claim that the difference *is* the scan can be
+/// checked rather than asserted: the scan is the only part of a miss that is
+/// linear in live entries, so these three rows — 11, 23 and 47 live entries,
+/// all on the vector path — must fall on a line. `table small` is the control
+/// and not a fourth point; see its comment.
+fn benchEncodeTable1k(iterations: u64) u64 {
+    return benchEncodeTable(iterations, .miss, 1024);
+}
+
+fn benchEncodeTable2k(iterations: u64) u64 {
+    return benchEncodeTable(iterations, .miss, 2048);
+}
+
+const TableProbe = enum {
+    /// A field in neither table: both hash arrays are walked end to end, and
+    /// the field is then inserted, evicting the oldest and keeping the table
+    /// saturated.
+    miss,
+    /// The newest entry, which matches on the first comparison and inserts
+    /// nothing. The floor the miss row is read against.
+    hit,
+};
+
+fn benchEncodeTable(iterations: u64, probe: TableProbe, comptime capacity: u32) u64 {
+    assert(iterations >= 1);
+
+    var storage: hpack.Encoder.Storage(capacity) = .{};
+    var encoder = storage.encoder(.dynamic);
+    var target: [4096]u8 = undefined;
+
+    // Saturate before timing anything.
+    for (churn_fields) |field| {
+        _ = encoder.encodeField(&target, field) catch unreachable;
+    }
+    assert(encoder.table.count >= 1);
+    // Which code path this row actually times, pinned rather than assumed. A
+    // change to the field shapes that dropped a row under one vector would
+    // otherwise move it silently to the untouched strided walk — which is
+    // exactly what `table small` does on purpose, and what the other rows must
+    // not.
+    if (capacity == 4096) assert(encoder.table.count >= churn_entries_min);
+    if (capacity >= 1024) assert(encoder.table.count >= scan_lanes_bench);
+    if (capacity == 256) assert(encoder.table.count < scan_lanes_bench);
+    // The pool has to outlast the table, or a probe would find its own entry.
+    comptime assert(churn_count > capacity / @as(u32, hpack.Field.overhead));
+
+    var checksum: u64 = 0;
+    var index: u64 = 0;
+    while (index < iterations) : (index += 1) {
+        const field = switch (probe) {
+            .miss => churn_fields[@intCast(index % churn_fields.len)],
+            // Position zero: whatever the saturating loop inserted last.
+            .hit => churn_fields[churn_fields.len - 1],
+        };
+        checksum +%= encoder.encodeField(&target, field) catch unreachable;
+        std.mem.doNotOptimizeAway(checksum);
+    }
+    return checksum;
+}
+
 fn benchEncode(iterations: u64, mode: hpack.Encoder.Mode) u64 {
     assert(iterations >= 1);
     var checksum: u64 = 0;
