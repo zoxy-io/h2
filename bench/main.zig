@@ -696,9 +696,13 @@ fn report(results: []const Result, iterations: u64) void {
             nanosecondsPerOp(result.min_ns, iterations),
         });
     }
+    // Which build this was. The numbers move by tens of percent between the
+    // two — `block assembly` by a factor of three — so a table without this
+    // line is a table that can be compared against the wrong thing.
     std.debug.print(
-        "\n{d} iterations per run. Compare bands across runs, never single numbers.\n",
-        .{iterations},
+        "\n{d} iterations per run, assertions {s}. " ++
+            "Compare bands across runs, never single numbers.\n",
+        .{ iterations, if (h2.assertions.enabled) "on" else "off" },
     );
 }
 

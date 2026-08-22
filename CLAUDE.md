@@ -19,6 +19,13 @@ zoxy-io/zoxy#173 and zoxy-io/zrk#21.
 - `zig build ci` — the format check, unit tests, the lint's own tests, the fuzz
   corpus, and the boundary lint. This is exactly what CI runs, on each target
   natively.
+- `zig build ci -Doptimize=ReleaseFast` and
+  `zig build ci -Doptimize=ReleaseFast -Dassertions=false` — the two builds that
+  ship, zoxy's and zrk's. Not optional, and note that the Debug run above does
+  *not* substitute: `-Dassertions=false` in Debug removes the `if (!ok)` and
+  nothing else, so only a release mode tests that the checks are gone, and only
+  a release mode reaches the undefined behaviour a `catch unreachable` guarded
+  by a removed assertion becomes. CI runs all three legs.
 - `zig build bench` — the performance gate. **Not optional for a change that
   touches a decode or encode path.** Compare bands across runs, never single
   numbers: a 3% move between two runs on a laptop is noise, and reporting it as
@@ -49,6 +56,21 @@ is not represented by any test that runs on a laptop.
   `bench/`, for a comparison against an established implementation, which is
   outside `src/` and outside the lint's walk — the same arrangement hparse uses
   for picohttpparser.
+- **An assertion may not be the only guard on a `catch unreachable`.** This is
+  the rule the option makes load-bearing, and it has already been violated once:
+  `Encoder.encodeSizeUpdate` guarded `setCapacity`'s `catch unreachable` with
+  `assert(capacity <= capacityMax())`, and with `-Dassertions=false` in
+  ReleaseFast that became an unkillable spin on a value a consumer takes from
+  the peer's `SETTINGS_HEADER_TABLE_SIZE`. If an `unreachable` is reachable when
+  the assertions are gone, the guard is a returned error and the assertion is
+  documentation. Audit every `catch unreachable` and every `=> unreachable` you
+  add for this, and say in the comment which real check makes it unreachable.
+- **Assertions are a build option, not a consequence of the optimize mode.**
+  `std.debug.assert` is lint-forbidden under `src/`: it is `if (!ok) unreachable`
+  and `ReleaseFast` deletes the check, so a consumer building for speed would
+  silently ship a codec with its invariant checks removed. Use
+  `@import("../assert.zig").assert`. Comptime assertions are exempt from
+  `-Dassertions` automatically — several are proofs the package rests on.
 - **No allocator, anywhere.** Not "no allocation after init" — there is no
   `init` in a library. `std.mem.Allocator` does not appear in `src/`, and
   `zig build lint` enforces it. Every buffer is caller-owned and caller-sized,

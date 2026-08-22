@@ -29,6 +29,10 @@ stay in the consumer.
 * Never copies where a slice will do.
 * Caller-owned, caller-sized buffers, including HPACK's dynamic table.
 * Zero dependencies beyond the Zig toolchain.
+* Assertions ship by default, in every optimize mode. Roughly 350 of them, and
+  several are the only check on an arithmetic relation. `-Dassertions=false`
+  removes them for a consumer that has made that argument — see
+  [`src/assert.zig`](src/assert.zig) for why this is not `std.debug.assert`.
 * Bytes in, frames and header fields out — no reader, writer or `std.Io` in the
   seam. Its two consumers, [zoxy](https://github.com/zoxy-io/zoxy) (reverse
   proxy, libxev completion callbacks) and
@@ -87,6 +91,8 @@ the bound on a field block, which is what stops the CONTINUATION flood.
 
 ```sh
 zig build ci      # format check, tests, fuzz corpus, interop corpus, boundary lint
+zig build ci -Doptimize=ReleaseFast                     # zoxy's build
+zig build ci -Doptimize=ReleaseFast -Dassertions=false  # zrk's build
 zig build bench   # decode/encode microbenchmarks (ReleaseFast)
 zig build fuzz    # replay the fuzz corpus; --fuzz to actually fuzz
 zig build corpus  # interoperability conformance against other implementations
@@ -95,7 +101,11 @@ zig build example # build and run the usage example above
 ```
 
 CI runs `zig build ci` natively on each target, so the tests run rather than
-merely cross-compile.
+merely cross-compile, and runs all three rows above. The release rows are not
+redundant: `-Dassertions=false` in Debug removes the `if (!ok)` and nothing
+else, so only a release mode tests that the checks are actually gone — and only
+a release mode reaches the undefined behaviour that a `catch unreachable`
+guarded by a removed assertion becomes.
 
 ## Style
 

@@ -51,7 +51,7 @@ const syntax = @import("syntax.zig");
 
 const MessageValidator = @This();
 
-const assert = std.debug.assert;
+const assert = @import("../assert.zig").assert;
 
 /// Which set of pseudo-header fields is defined for this field block.
 pub const Kind = enum {

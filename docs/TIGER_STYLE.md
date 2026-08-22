@@ -84,7 +84,7 @@ across a whole header block".
 
 The back-of-the-envelope discipline still applies, against those resources.
 
-## The one open conflict: assertions in release builds
+## The resolved conflict: assertions in release builds
 
 zoxy: "assertions are always on (dev **and** release); they downgrade correctness
 bugs into liveness bugs." zoxy can enforce that in its own build. A library
@@ -98,9 +98,26 @@ disagree:
   cost there (h2 makes header decoding mandatory where HTTP/1.1 was a scan for
   CRLF), and it points this decoder at servers it chose to benchmark.
 
-Resolution: a **build option, defaulting to on**. zoxy inherits the default and
+Resolution: `-Dassertions`, **defaulting to on**. zoxy inherits the default and
 states nothing; zrk opts out explicitly, in a line a reviewer can see, having
 made the argument for it. Neither consumer silently gets the other's policy.
+
+Implemented in [`src/assert.zig`](../src/assert.zig), and note *why* it needed
+implementing rather than being spelled `std.debug.assert`: that is
+`if (!ok) unreachable`, and `unreachable` is undefined behaviour in `ReleaseFast`
+and `ReleaseSmall`, so the optimizer deletes the check. Deriving assertion
+policy from the optimize mode is exactly the behaviour this replaces — a
+consumer choosing ReleaseFast for throughput is not thereby choosing to ship a
+codec with its invariant checks removed.
+
+`zig build lint` forbids `std.debug.assert` under `src/`. A convention that is
+not mechanical drifts back the first time someone types the familiar name.
+
+The cost is not small and is not a worry to be waved at — it is measured, both
+ways, and the table is in the commit that added the option. `zig build ci` runs
+with the option on and off, because a test suite that only passes with
+assertions on is a suite where something depends on an assertion for its
+behaviour rather than for its correctness.
 
 ## Threat model
 

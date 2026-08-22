@@ -36,7 +36,7 @@
 
 const std = @import("std");
 
-const assert = std.debug.assert;
+const assert = @import("../assert.zig").assert;
 
 const Header = @import("Header.zig");
 

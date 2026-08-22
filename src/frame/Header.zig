@@ -39,7 +39,7 @@ const std = @import("std");
 
 const Header = @This();
 
-const assert = std.debug.assert;
+const assert = @import("../assert.zig").assert;
 
 /// Octets in the header itself.
 pub const octets: u32 = 9;
@@ -255,11 +255,18 @@ pub fn render(header: Header, target: []u8) RenderError!u32 {
 /// True when `flag` is set.
 ///
 /// Asserts the flag is one this frame's type defines, so asking a DATA frame
-/// whether it is an ACK is caught rather than silently answered about
-/// END_STREAM — in a build with assertions on. docs/TIGER_STYLE.md makes that
-/// a build option defaulting to on, and this package does not implement the
-/// option yet, so a `ReleaseFast` consumer gets no check. Until it does, treat
-/// the pairing as the caller's responsibility and not this function's.
+/// whether it carries END_HEADERS is caught rather than silently answered
+/// about a bit DATA does not define.
+///
+/// The check is there in any optimize mode unless a consumer passed
+/// `-Dassertions=false`; see `src/assert.zig`. It was not, for the first four
+/// slices of this package: `std.debug.assert` is elided in `ReleaseFast`, and
+/// this comment used to say so and leave the pairing to the caller.
+///
+/// Note what it cannot catch. END_STREAM and ACK are the same bit, so asking a
+/// DATA frame whether it is an ACK passes — the assertion is on the bit the
+/// type defines, and DATA defines that one. That is why `Flag.bit` is a mapping
+/// rather than the enum's value, and why the type is consulted first.
 pub fn has(header: Header, flag: Flag) bool {
     assert(definedFlags(header.frame_type) & flag.bit() != 0);
     return header.flags & flag.bit() != 0;

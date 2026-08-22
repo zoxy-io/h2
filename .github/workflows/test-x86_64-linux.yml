@@ -28,6 +28,21 @@ jobs:
       - name: Gates
         run: zig build ci -Dtarget=${{ matrix.target }}
 
+      # The two builds that actually ship, because the Debug leg above does not
+      # exercise either. `-Dassertions=false` in Debug removes the `if (!ok)`
+      # and nothing else — the condition is still evaluated, and a safety check
+      # inside one still traps — so it tests that the package compiles and
+      # behaves without assertions, not that they are gone. Only a release mode
+      # tests the elision, and only a release mode reaches the undefined
+      # behaviour a `catch unreachable` guarded by a removed assertion becomes.
+      # That distinction is not academic: it is how a livelock in
+      # `Encoder.encodeSizeUpdate` reached review rather than CI.
+      - name: Gates, zoxy's build (ReleaseFast, assertions on)
+        run: zig build ci -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+      - name: Gates, zrk's build (ReleaseFast, assertions off)
+        run: zig build ci -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dassertions=false
+
       # Not a measurement — a shared runner cannot produce a comparable band.
       # This only proves the benchmark still compiles and runs, so it cannot
       # rot between the days someone reads its numbers.

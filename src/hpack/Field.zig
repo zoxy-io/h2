@@ -22,7 +22,7 @@ const std = @import("std");
 
 const Field = @This();
 
-const assert = std.debug.assert;
+const assert = @import("../assert.zig").assert;
 
 name: []const u8,
 value: []const u8,

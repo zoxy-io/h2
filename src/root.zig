@@ -8,11 +8,17 @@
 
 const std = @import("std");
 
+/// `assert` and the `-Dassertions` build option. Named for the option rather
+/// than for the function, so the flag reads `h2.assertions.enabled` and the
+/// function does not stutter as `h2.assert.assert`.
+pub const assertions = @import("assert.zig");
+
 pub const fields = @import("fields.zig");
 pub const frame = @import("frame.zig");
 pub const hpack = @import("hpack.zig");
 
 test {
+    _ = assertions;
     _ = fields;
     _ = frame;
     _ = hpack;

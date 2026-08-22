@@ -64,6 +64,22 @@ const boundaries = [_]Boundary{
         .message = "no allocator: buffers are caller-owned and caller-sized " ++
             "(tests use std.testing.allocator)",
     },
+    // `.debug.assert` rather than `std.debug.assert`, which is strictly
+    // stronger: it catches the `@import("std").debug.assert` one-liner too.
+    //
+    // What it does not catch is an alias — `const d = std.debug;` and then
+    // `d.assert(...)`. Closing that would mean forbidding `std.debug` outright,
+    // and `src/` uses `std.debug.print` legitimately in its tests. The alias
+    // line itself is conspicuous in a review in a way that typing the familiar
+    // name is not, which is the drift this rule is actually aimed at.
+    .{
+        .needle = ".debug.assert",
+        .confined_to = "",
+        .message = "use `@import(\"../assert.zig\").assert`: std.debug.assert is " ++
+            "`if (!ok) unreachable`, which ReleaseFast and ReleaseSmall are " ++
+            "entitled to delete, so a consumer building for speed would ship a " ++
+            "codec with its invariant checks removed (see src/assert.zig)",
+    },
     .{ .needle = "std.Io", .confined_to = "", .message = no_io_message },
     .{ .needle = "std.posix", .confined_to = "", .message = no_io_message },
     .{ .needle = "std.os", .confined_to = "", .message = no_io_message },
@@ -365,6 +381,20 @@ test "lintLine: I/O types are forbidden everywhere" {
 test "lintLine: no allocator, but std.testing.allocator is a different needle" {
     try std.testing.expect(lintLine("fn init(gpa: std.mem.Allocator) void {}", "hpack.zig") != null);
     try std.testing.expect(lintLine("const a = std.testing.allocator;", "hpack.zig") == null);
+}
+
+test "lintLine: std.debug.assert is forbidden, the package's own assert is not" {
+    // The rule exists because `std.debug.assert` is `if (!ok) unreachable`, and
+    // ReleaseFast may delete the check. A convention that is not mechanical
+    // drifts back the first time someone types the familiar name.
+    try std.testing.expect(lintLine("const assert = std.debug.assert;", "hpack/Decoder.zig") != null);
+    try std.testing.expect(lintLine("    std.debug.assert(index < len);", "frame/payload.zig") != null);
+    // The one-liner that evades a `std.debug.assert` needle.
+    try std.testing.expect(lintLine("const a = @import(\"std\").debug.assert;", "root.zig") != null);
+    try std.testing.expect(lintLine("const assert = @import(\"../assert.zig\").assert;", "hpack/Decoder.zig") == null);
+    try std.testing.expect(lintLine("    assert(index < len);", "frame/payload.zig") == null);
+    // `std.debug.print` and the rest of `std.debug` are not the target.
+    try std.testing.expect(lintLine("std.debug.print(\"x\", .{});", "root.zig") == null);
 }
 
 test "lintLine: @cImport is forbidden" {

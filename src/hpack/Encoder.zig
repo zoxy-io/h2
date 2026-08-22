@@ -74,7 +74,7 @@ const std = @import("std");
 
 const Encoder = @This();
 
-const assert = std.debug.assert;
+const assert = @import("../assert.zig").assert;
 
 const DynamicTable = @import("DynamicTable.zig");
 const Field = @import("Field.zig");
@@ -242,6 +242,10 @@ const FieldError = error{
     OutputTooLong,
 };
 
+/// `encodeSizeUpdate`'s errors: `FieldError` plus the one that is about the
+/// capacity rather than about the target.
+pub const SizeUpdateError = FieldError || DynamicTable.CapacityError;
+
 /// Encode one field, or write nothing at all.
 ///
 /// Atomic by construction: the whole representation's length is computed before
@@ -284,12 +288,29 @@ pub fn encodeField(encoder: *Encoder, target: []u8, field: Field) FieldError!u32
 /// `capacity` is bounded by this encoder's arena, which is not necessarily what
 /// the peer will accept — see the module header on matching
 /// `SETTINGS_HEADER_TABLE_SIZE`.
-pub fn encodeSizeUpdate(encoder: *Encoder, target: []u8, capacity: u32) FieldError!u32 {
+///
+/// That bound is a *returned error*, not an assertion, and the distinction is
+/// the whole reason `src/assert.zig` exists. A consumer will plausibly pass a
+/// capacity straight from the peer's `SETTINGS_HEADER_TABLE_SIZE`, so this is
+/// peer-controlled input reaching a `pub fn`; guarding it with an assertion
+/// left `setCapacity`'s `catch unreachable` genuinely reachable, and under
+/// `-Dassertions=false` in ReleaseFast that is undefined behaviour — measured
+/// as an unkillable spin, which is a remote livelock on zoxy's threat model.
+///
+/// Checked before anything is written, so a rejected call leaves `target`
+/// untouched — the same atomicity `encodeField` documents.
+pub fn encodeSizeUpdate(encoder: *Encoder, target: []u8, capacity: u32) SizeUpdateError!u32 {
+    // Still an assertion, and correctly so: a `.static_only` encoder emitting a
+    // size update is a caller's programming error, not something a peer can
+    // provoke.
     assert(encoder.mode == .dynamic);
-    assert(capacity <= encoder.table.capacityMax());
+    if (capacity > encoder.table.capacityMax()) return error.CapacityTooLarge;
+
     const written = integer.encode(target, capacity, prefix_size_update, tag_size_update) catch
         return error.OutputTooLong;
-    encoder.table.setCapacity(capacity) catch unreachable; // Bounded above.
+    // Now genuinely unreachable: the check above is the same one `setCapacity`
+    // makes, and it is in the binary whatever `-Dassertions` says.
+    encoder.table.setCapacity(capacity) catch unreachable;
     assert(encoder.table.capacity == capacity);
     assert(encoder.table.size <= capacity);
     return written;
@@ -739,6 +760,30 @@ test "the dynamic table is searched, newest first" {
     const third = encoder.encode(&block, &other);
     try testing.expect(third.written > 1);
     try testing.expect(third.written < first.written);
+}
+
+test "a capacity larger than the arena is refused, not asserted" {
+    // The guard used to be an assertion, which `-Dassertions=false` removes —
+    // and then `setCapacity`'s `catch unreachable` was reachable from a `pub
+    // fn` on a value a consumer plausibly takes from the peer's
+    // SETTINGS_HEADER_TABLE_SIZE. In ReleaseFast that was an unkillable spin.
+    // This test fails against the assertion-guarded version in every build
+    // where assertions are off, and panics in every build where they are on.
+    var storage: Storage(256) = .{};
+    var encoder = storage.encoder(.dynamic);
+    var target: [64]u8 = undefined;
+
+    try std.testing.expectError(
+        error.CapacityTooLarge,
+        encoder.encodeSizeUpdate(&target, 4096),
+    );
+    // Nothing was written and nothing moved: the check runs before the encode.
+    try std.testing.expectEqual(@as(u32, 256), encoder.table.capacity);
+
+    // The boundary itself is accepted.
+    const written = try encoder.encodeSizeUpdate(&target, encoder.table.capacityMax());
+    try std.testing.expect(written >= 1);
+    try std.testing.expectEqual(encoder.table.capacityMax(), encoder.table.capacity);
 }
 
 test "a size update moves both tables and is accepted by the decoder" {

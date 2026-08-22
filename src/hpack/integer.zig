@@ -16,7 +16,7 @@
 
 const std = @import("std");
 
-const assert = std.debug.assert;
+const assert = @import("../assert.zig").assert;
 
 /// The most continuation octets a value may use.
 ///

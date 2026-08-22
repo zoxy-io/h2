@@ -4,11 +4,28 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Assertions in release builds: the one place docs/TIGER_STYLE.md records
+    // that the two consumers genuinely disagree, so it is a knob rather than a
+    // decision this package makes for them. On by default — zoxy inherits it
+    // and says nothing; zrk passes `.assertions = false` through
+    // `b.dependency` in a line a reviewer can see.
+    //
+    // Not derived from `optimize`. `std.debug.assert` already derives from it,
+    // and deriving is exactly the behaviour this replaces: a consumer choosing
+    // ReleaseFast for throughput is not thereby choosing to ship a codec with
+    // its invariant checks removed.
+    const assertions = b.option(bool, "assertions", "Compile in run-time assertions (default true)") orelse true;
+    const h2_options = b.addOptions();
+    h2_options.addOption(bool, "assertions", assertions);
+
     // The public module: consumers `@import("h2")` this.
     const h2_module = b.addModule("h2", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "build_options", .module = h2_options.createModule() },
+        },
     });
 
     const lib = b.addLibrary(.{
@@ -125,6 +142,24 @@ pub fn build(b: *std.Build) void {
     const example_step = b.step("example", "Build and run the README's usage example");
     example_step.dependOn(&example_run.step);
 
+    // A negative fixture: `checks/` holds files that must FAIL to compile. This
+    // one proves that a `comptime` assertion is still checked with
+    // `-Dassertions=false`, which no `test` block can express — the first
+    // attempt was `comptime assert(true)`, which passes even if the comptime
+    // branch is deleted outright.
+    const comptime_check = b.addObject(.{
+        .name = "h2-comptime-assert-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("checks/comptime_assert_is_not_optional.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "h2", .module = h2_module }},
+        }),
+    });
+    comptime_check.expect_errors = .{ .contains = "reached unreachable code" };
+    const checks_step = b.step("checks", "Fixtures that must fail to compile");
+    checks_step.dependOn(&comptime_check.step);
+
     const test_step = b.step("test", "Run unit tests, the lint's own tests, and the fuzz corpus");
     test_step.dependOn(&module_tests.step);
     test_step.dependOn(&lint_tests.step);
@@ -133,11 +168,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&corpus_run.step);
     // So that `zig build ci` fails on a README example that stopped compiling.
     test_step.dependOn(&example_run.step);
+    test_step.dependOn(&comptime_check.step);
 
     // The format gate. A build step rather than a documented `zig fmt --check`
     // incantation, so that the list of formatted paths lives in exactly one
     // place and CI cannot check a different set than a developer does.
-    const fmt_paths = &.{ "src", "scripts", "bench", "fuzz", "example", "corpus/all.zig", "corpus/hpack.zig", "corpus/frames.zig", "build.zig", "build.zig.zon" };
+    const fmt_paths = &.{ "src", "scripts", "bench", "fuzz", "example", "checks", "corpus/all.zig", "corpus/hpack.zig", "corpus/frames.zig", "build.zig", "build.zig.zon" };
     const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
     const fmt_step = b.step("fmt", "Check formatting (zig build fmt-fix rewrites)");
     fmt_step.dependOn(&fmt_check.step);

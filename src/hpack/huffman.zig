@@ -35,7 +35,7 @@
 
 const std = @import("std");
 
-const assert = std.debug.assert;
+const assert = @import("../assert.zig").assert;
 
 const table = @import("huffman_codes.zig");
 

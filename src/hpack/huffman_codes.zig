@@ -13,7 +13,7 @@
 
 const std = @import("std");
 
-const assert = std.debug.assert;
+const assert = @import("../assert.zig").assert;
 
 /// One symbol's code. `code` is right-aligned in `bits` significant bits.
 pub const Code = struct {

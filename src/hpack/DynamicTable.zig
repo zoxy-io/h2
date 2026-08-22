@@ -57,7 +57,7 @@ const std = @import("std");
 
 const DynamicTable = @This();
 
-const assert = std.debug.assert;
+const assert = @import("../assert.zig").assert;
 
 const Field = @import("Field.zig");
 const memory = @import("memory.zig");
@@ -286,9 +286,9 @@ fn evictTo(table: *DynamicTable, limit: u32) void {
     // `count` is in the condition rather than only in an assertion. Every pass
     // drops one entry and every entry charges at least `Field.overhead`, so the
     // size argument alone does terminate — but assertions are a build option
-    // here (docs/TIGER_STYLE.md), and with them off a `size`/`count`
-    // disagreement would underflow `count - 1` to `maxInt(u32)` and spin. The
-    // bound belongs where it cannot be compiled out.
+    // here (`-Dassertions`, see src/assert.zig), and with them off a
+    // `size`/`count` disagreement would underflow `count - 1` to `maxInt(u32)`
+    // and spin. The bound belongs where it cannot be compiled out.
     while (table.count > 0 and table.size > limit) {
         const oldest = table.entries[table.slotOf(table.count - 1)];
         // FIFO means the oldest entry is always at the front of the live span.

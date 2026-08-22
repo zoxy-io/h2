@@ -47,7 +47,7 @@ const std = @import("std");
 
 const BlockAssembler = @This();
 
-const assert = std.debug.assert;
+const assert = @import("../assert.zig").assert;
 
 const Header = @import("Header.zig");
 const payload_codec = @import("payload.zig");

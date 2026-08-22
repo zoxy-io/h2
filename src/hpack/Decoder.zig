@@ -57,7 +57,7 @@ const std = @import("std");
 
 const Decoder = @This();
 
-const assert = std.debug.assert;
+const assert = @import("../assert.zig").assert;
 
 const DynamicTable = @import("DynamicTable.zig");
 const Field = @import("Field.zig");

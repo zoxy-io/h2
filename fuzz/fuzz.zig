@@ -29,6 +29,24 @@ const h2 = @import("h2");
 const frame = h2.frame;
 const hpack = h2.hpack;
 
+/// The oracle's own assert, always on.
+///
+/// Deliberately not `std.debug.assert` and deliberately not the library's
+/// `-Dassertions`-gated one. Every property these targets check is expressed as
+/// an assertion, so an assertion the build can remove is a fuzz target the
+/// build can turn into a crash-only fuzzer — and `zig build fuzz --fuzz
+/// -Doptimize=ReleaseFast` is the natural way to actually fuzz. That is the
+/// same failure this package's `-Dassertions` option exists to fix, one
+/// directory over.
+///
+/// Note the library's *internal* assertions are a separate matter: those follow
+/// `-Dassertions`, and fuzzing with them off is a legitimate thing to do — it
+/// checks that the decoders reject on their own rather than on an invariant
+/// check. What must not vanish is the oracle.
+fn assert(ok: bool) void {
+    if (!ok) @panic("fuzz: oracle assertion failed");
+}
+
 /// Inputs are capped so a failing case stays small enough to read.
 const input_max = 1024;
 
@@ -87,7 +105,7 @@ fn fuzzFrameHeader(_: void, smith: *std.testing.Smith) !void {
     // receipt and sent as zero. The mask is the codec's own, so this cannot
     // drift from what `parse` actually does.
     expected[5] &= @truncate(frame.Header.stream_identifier_mask >> 24);
-    std.debug.assert(std.mem.eql(u8, &expected, &rendered));
+    assert(std.mem.eql(u8, &expected, &rendered));
 
     // Any value a peer could legally advertise, so the bound itself is drawn
     // rather than fixed at the floor.
@@ -96,15 +114,15 @@ fn fuzzFrameHeader(_: void, smith: *std.testing.Smith) !void {
     if (header.validate(max_frame_size)) {
         // A header that validates is one whose length fits the bound, whatever
         // else it says.
-        std.debug.assert(header.length <= max_frame_size);
+        assert(header.length <= max_frame_size);
     } else |err| {
         const code = @intFromEnum(frame.Header.errorCode(err));
-        std.debug.assert(code == 0x01 or code == 0x06);
+        assert(code == 0x01 or code == 0x06);
         // Severity is decidable for every failure, and a stream error needs a
         // stream: nothing on stream zero may be answered with RST_STREAM.
         const how = header.severity(err);
-        if (header.stream_identifier == 0) std.debug.assert(how == .connection);
-        if (err == error.Protocol) std.debug.assert(how == .connection);
+        if (header.stream_identifier == 0) assert(how == .connection);
+        if (err == error.Protocol) assert(how == .connection);
     }
 }
 
@@ -138,7 +156,7 @@ fn fuzzFramePayload(_: void, smith: *std.testing.Smith) !void {
 
     const wire = buffer[0..length];
     const header = frame.Header.parse(wire) catch unreachable;
-    std.debug.assert(header.length == body_length);
+    assert(header.length == body_length);
     header.validate(frame.Header.max_frame_size_min) catch return;
 
     const body = wire[frame.Header.octets..][0..header.length];
@@ -164,8 +182,8 @@ fn fuzzFramePayload(_: void, smith: *std.testing.Smith) !void {
             sender_flags,
             &rendered,
         ) catch unreachable;
-        std.debug.assert(written == wire.len);
-        std.debug.assert(std.mem.eql(u8, rendered[0..written], wire));
+        assert(written == wire.len);
+        assert(std.mem.eql(u8, rendered[0..written], wire));
     }
 
     // Everything borrowed points into the payload it came from.
@@ -182,8 +200,8 @@ fn fuzzFramePayload(_: void, smith: *std.testing.Smith) !void {
             assertBorrowed(body, promise.fragment);
             if (promise.padding) |padding| assertBorrowed(body, padding);
             // Section 5.1.1, restated where a parse could get it wrong.
-            std.debug.assert(promise.promised_stream_identifier % 2 == 0);
-            std.debug.assert(promise.promised_stream_identifier != 0);
+            assert(promise.promised_stream_identifier % 2 == 0);
+            assert(promise.promised_stream_identifier != 0);
         },
         .goaway => |goaway| assertBorrowed(body, goaway.debug_data),
         .continuation => |continuation| assertBorrowed(body, continuation.fragment),
@@ -192,10 +210,10 @@ fn fuzzFramePayload(_: void, smith: *std.testing.Smith) !void {
             var iterator = settings.iterate();
             var seen: u32 = 0;
             while (iterator.next()) |_| seen += 1;
-            std.debug.assert(seen == settings.count());
+            assert(seen == settings.count());
         },
         .ping => |ping| assertBorrowed(body, ping.opaque_data),
-        .window_update => |update| std.debug.assert(update.increment != 0),
+        .window_update => |update| assert(update.increment != 0),
         .unknown => |octets| assertBorrowed(body, octets),
         .priority, .rst_stream => {},
     }
@@ -206,8 +224,8 @@ fn assertBorrowed(owner: []const u8, borrowed: []const u8) void {
     if (borrowed.len == 0) return;
     const owner_begin = @intFromPtr(owner.ptr);
     const begin = @intFromPtr(borrowed.ptr);
-    std.debug.assert(begin >= owner_begin);
-    std.debug.assert(begin + borrowed.len <= owner_begin + owner.len);
+    assert(begin >= owner_begin);
+    assert(begin + borrowed.len <= owner_begin + owner.len);
 }
 
 test "fuzz: field block assembly" {
@@ -247,20 +265,20 @@ fn fuzzBlockAssembly(_: void, smith: *std.testing.Smith) !void {
         const accepted = assembler.accept(header, &parsed) catch |err| {
             // Every failure ends the connection, and leaves nothing a caller
             // could keep feeding.
-            std.debug.assert(frame.BlockAssembler.severity(err) == .connection);
-            std.debug.assert(!assembler.isOpen());
+            assert(frame.BlockAssembler.severity(err) == .connection);
+            assert(!assembler.isOpen());
             _ = frame.BlockAssembler.errorCode(err);
             return;
         };
 
         switch (accepted) {
-            .passthrough => std.debug.assert(!assembler.isOpen()),
-            .fragment => std.debug.assert(assembler.isOpen()),
+            .passthrough => assert(!assembler.isOpen()),
+            .fragment => assert(assembler.isOpen()),
             .block => |block| {
                 // A finished block fits the buffer it was assembled in, and
                 // the assembler is ready for the next one.
-                std.debug.assert(block.fragment.len <= assembly.len);
-                std.debug.assert(!assembler.isOpen());
+                assert(block.fragment.len <= assembly.len);
+                assert(!assembler.isOpen());
                 assertBorrowed(&assembly, block.fragment);
             },
         }
@@ -289,7 +307,7 @@ fn fuzzDecoder(_: void, smith: *std.testing.Smith) !void {
     // Bounded: no representation is shorter than one octet of wire, so a block
     // of `length` octets cannot yield more than `length` fields.
     while (produced <= length) : (produced += 1) {
-        std.debug.assert(produced <= length);
+        assert(produced <= length);
         const field = iterator.next() catch break;
         if (field == null) break;
 
@@ -297,12 +315,12 @@ fn fuzzDecoder(_: void, smith: *std.testing.Smith) !void {
         // charged itself is consistent with it.
         std.mem.doNotOptimizeAway(field.?.name.len);
         std.mem.doNotOptimizeAway(field.?.value.len);
-        std.debug.assert(iterator.headerListSize() >= field.?.size());
-        std.debug.assert(iterator.headerListSize() <= list_size_max);
+        assert(iterator.headerListSize() >= field.?.size());
+        assert(iterator.headerListSize() <= list_size_max);
     }
     // Whatever the input asked for, the table stayed inside the arena it was
     // given.
-    std.debug.assert(decoder.table.size <= decoder.table.capacity);
+    assert(decoder.table.size <= decoder.table.capacity);
 }
 
 test "fuzz: hpack round trip" {
@@ -353,21 +371,21 @@ fn fuzzRoundTrip(_: void, smith: *std.testing.Smith) !void {
         // A short block is an ordinary outcome, not a failure: the encoder
         // stops rather than mutating a table for octets it did not write. What
         // it did write must decode exactly.
-        std.debug.assert(encoded.fields <= count);
+        assert(encoded.fields <= count);
 
         var buffer: [input_max * block_expansion_max]u8 = undefined;
         var iterator = decoder.iterate(&buffer, block[0..encoded.written]);
         for (fields[0..encoded.fields]) |want| {
             const got = (try iterator.next()) orelse unreachable;
-            std.debug.assert(std.mem.eql(u8, want.name, got.name));
-            std.debug.assert(std.mem.eql(u8, want.value, got.value));
-            std.debug.assert(want.never_indexed == got.never_indexed);
+            assert(std.mem.eql(u8, want.name, got.name));
+            assert(std.mem.eql(u8, want.value, got.value));
+            assert(want.never_indexed == got.never_indexed);
         }
-        std.debug.assert((try iterator.next()) == null);
+        assert((try iterator.next()) == null);
 
         // The invariant that keeps a connection decodable past its first block.
-        std.debug.assert(encoder.table.size == decoder.table.size);
-        std.debug.assert(encoder.table.count == decoder.table.count);
+        assert(encoder.table.size == decoder.table.size);
+        assert(encoder.table.count == decoder.table.count);
     }
 }
 
@@ -416,10 +434,10 @@ fn fuzzDynamicTable(_: void, smith: *std.testing.Smith) !void {
         }
 
         // The span invariants, which every operation above has to preserve.
-        std.debug.assert(table.size <= table.capacity);
-        std.debug.assert(table.begin <= table.end);
-        std.debug.assert(table.end <= table.arena.len);
-        if (table.count == 0) std.debug.assert(table.begin == table.end);
+        assert(table.size <= table.capacity);
+        assert(table.begin <= table.end);
+        assert(table.end <= table.arena.len);
+        if (table.count == 0) assert(table.begin == table.end);
     }
 }
 
@@ -444,8 +462,8 @@ fn fuzzHuffman(_: void, smith: *std.testing.Smith) !void {
 
     var reencoded: [input_max * huffman_expansion_max]u8 = undefined;
     const encoded_length = try hpack.huffman.encode(&reencoded, decoded[0..written]);
-    std.debug.assert(encoded_length == length);
-    std.debug.assert(std.mem.eql(u8, reencoded[0..encoded_length], wire[0..length]));
+    assert(encoded_length == length);
+    assert(std.mem.eql(u8, reencoded[0..encoded_length], wire[0..length]));
 }
 
 test "fuzz: huffman kernels agree" {
@@ -479,17 +497,17 @@ fn fuzzHuffmanAgreement(_: void, smith: *std.testing.Smith) !void {
         // Reachable only on the bug this target hunts: the automaton accepted
         // and the window did not.
         const other = hpack.huffman.decode(window[0..capacity], wire[0..length]) catch unreachable;
-        std.debug.assert(written == other);
+        assert(written == other);
     } else |err| {
         if (hpack.huffman.decode(window[0..capacity], wire[0..length])) |_| {
             // The window accepted what the automaton rejected.
             unreachable;
         } else |other| {
-            std.debug.assert(err == other);
+            assert(err == other);
         }
     }
     // Whatever each wrote, including on the error paths.
-    std.debug.assert(std.mem.eql(u8, reference[0..capacity], window[0..capacity]));
+    assert(std.mem.eql(u8, reference[0..capacity], window[0..capacity]));
 }
 
 test "fuzz: huffman round trip" {
@@ -503,11 +521,11 @@ fn fuzzHuffmanRoundTrip(_: void, smith: *std.testing.Smith) !void {
 
     var wire: [input_max * huffman_expansion_max]u8 = undefined;
     const encoded_length = try hpack.huffman.encode(&wire, text[0..length]);
-    std.debug.assert(encoded_length == hpack.huffman.encodedLength(text[0..length]));
+    assert(encoded_length == hpack.huffman.encodedLength(text[0..length]));
 
     var decoded: [input_max]u8 = undefined;
     const written = try hpack.huffman.decode(&decoded, wire[0..encoded_length]);
-    std.debug.assert(std.mem.eql(u8, decoded[0..written], text[0..length]));
+    assert(std.mem.eql(u8, decoded[0..written], text[0..length]));
 }
 
 test "fuzz: integer codec" {
@@ -522,8 +540,8 @@ fn fuzzInteger(_: void, smith: *std.testing.Smith) !void {
 
     const prefix_bits: u4 = @intCast(1 + @as(u4, smith.value(u3)));
     const decoded = hpack.integer.decode(source[0..length], prefix_bits) catch return;
-    std.debug.assert(decoded.octets >= 1);
-    std.debug.assert(decoded.octets <= length);
+    assert(decoded.octets >= 1);
+    assert(decoded.octets <= length);
 
     // Re-encoding must reproduce the *value*, not the octets. RFC 7541 section
     // 5.1 permits a non-minimal encoding — `{0x1f, 0x80, 0x00}` and
@@ -536,12 +554,12 @@ fn fuzzInteger(_: void, smith: *std.testing.Smith) !void {
     const prefix_mask: u8 = @intCast((@as(u16, 1) << prefix_bits) - 1);
     const tag: u8 = source[0] & ~prefix_mask;
     const written = try hpack.integer.encode(&target, decoded.value, prefix_bits, tag);
-    std.debug.assert(written == hpack.integer.encodedLength(decoded.value, prefix_bits));
-    std.debug.assert(written <= decoded.octets);
+    assert(written == hpack.integer.encodedLength(decoded.value, prefix_bits));
+    assert(written <= decoded.octets);
 
     const again = try hpack.integer.decode(target[0..written], prefix_bits);
-    std.debug.assert(again.value == decoded.value);
-    std.debug.assert(again.octets == written);
+    assert(again.value == decoded.value);
+    assert(again.octets == written);
 }
 
 /// Octets that classify differently across the four rules, so planting one is
@@ -571,7 +589,7 @@ test "fuzz: field syntax kernels agree" {
 fn fuzzFieldSyntax(_: void, smith: *std.testing.Smith) !void {
     var text: [input_max]u8 = undefined;
     const length = smith.index(text.len + 1);
-    std.debug.assert(length <= text.len);
+    assert(length <= text.len);
     // The base octet has to be one all four rule sets accept, or the planted
     // faults would never be the first rejection and every case would collapse
     // to the same answer.
@@ -582,7 +600,7 @@ fn fuzzFieldSyntax(_: void, smith: *std.testing.Smith) !void {
         const faults = smith.index(faults_max + 1);
         while (planted < faults) : (planted += 1) {
             const position = smith.index(length);
-            std.debug.assert(position < length);
+            assert(position < length);
             text[position] = interesting_octets[smith.index(interesting_octets.len)];
         }
     }
@@ -610,7 +628,7 @@ const faults_max = 3;
 comptime {
     // A fault has to have somewhere to go: the generator plants at a drawn
     // index into a run of at most `input_max` octets.
-    std.debug.assert(faults_max <= input_max);
+    assert(faults_max <= input_max);
 }
 
 /// Two results of the same error set are the same result: both accepted, or
@@ -649,7 +667,7 @@ comptime {
     // The "long enough" half of that sentence, which is a relation rather than
     // a number: a block has to be able to carry every pseudo-header once and
     // still have room to repeat one.
-    std.debug.assert(message_fields_max > std.enums.values(h2.fields.MessageValidator.Pseudo).len);
+    assert(message_fields_max > std.enums.values(h2.fields.MessageValidator.Pseudo).len);
 }
 
 test "fuzz: message validator" {
@@ -674,7 +692,7 @@ fn fuzzMessageValidator(_: void, smith: *std.testing.Smith) !void {
 
     var block: [message_fields_max]h2.hpack.Field = undefined;
     const count = smith.index(block.len + 1);
-    std.debug.assert(count <= block.len);
+    assert(count <= block.len);
     for (block[0..count]) |*offered| {
         offered.* = .{
             .name = drawn_names[smith.index(drawn_names.len)],

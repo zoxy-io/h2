@@ -58,7 +58,7 @@
 
 const std = @import("std");
 
-const assert = std.debug.assert;
+const assert = @import("../assert.zig").assert;
 
 /// How to read section 8.2.1. See the two-readings note above; the choice is
 /// the consumer's, so there is no default.
