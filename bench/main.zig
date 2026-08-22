@@ -46,6 +46,8 @@ const date_text = "Mon, 21 Oct 2013 20:13:21 GMT";
 /// rather than a new file with its own timing loop to get subtly wrong.
 const workloads = [_]Workload{
     .{ .name = "hpack decode", .run = benchHpackDecode },
+    .{ .name = "hpack encode", .run = benchHpackEncode },
+    .{ .name = "hpack encode static", .run = benchHpackEncodeStatic },
     .{ .name = "huffman decode", .run = benchHuffmanDecode },
     .{ .name = "huffman encode", .run = benchHuffmanEncode },
 };
@@ -96,6 +98,47 @@ fn benchHpackDecode(iterations: u64) u64 {
                     checksum +%= field.name.len +% field.value.len;
                     std.mem.doNotOptimizeAway(checksum);
                 }
+            }
+        }
+    }
+    return checksum;
+}
+
+/// Encode every Appendix C header list, each story against a fresh context.
+///
+/// This is zoxy's response path, and the cost centre is lookup rather than
+/// Huffman: a static-table probe and, on a miss, a scan of the dynamic table's
+/// hashes.
+fn benchHpackEncode(iterations: u64) u64 {
+    return benchEncode(iterations, .dynamic);
+}
+
+/// The same lists in static-only mode, which is zrk's path.
+///
+/// zrk encodes once at startup and replays, so this number is not on its hot
+/// path at all. It is here as the other half of the comparison: the difference
+/// between the two is what the dynamic table's bookkeeping costs.
+fn benchHpackEncodeStatic(iterations: u64) u64 {
+    return benchEncode(iterations, .static_only);
+}
+
+/// The body of both, which differ only in mode. Kept in one place so the two
+/// numbers stay comparable: a change to one that missed the other would look
+/// like a result.
+fn benchEncode(iterations: u64, mode: hpack.Encoder.Mode) u64 {
+    assert(iterations >= 1);
+    var checksum: u64 = 0;
+    var index: u64 = 0;
+    while (index < iterations) : (index += 1) {
+        for (stories) |story| {
+            var storage: hpack.Encoder.Storage(4096) = .{};
+            var encoder = storage.encoder(mode);
+            for (story.examples) |example| {
+                var block: [4096]u8 = undefined;
+                const encoded = encoder.encode(&block, example.fields);
+                assert(encoded.fields == example.fields.len);
+                checksum +%= encoded.written;
+                std.mem.doNotOptimizeAway(checksum);
             }
         }
     }

@@ -9,6 +9,7 @@ const std = @import("std");
 
 pub const Decoder = @import("hpack/Decoder.zig");
 pub const DynamicTable = @import("hpack/DynamicTable.zig");
+pub const Encoder = @import("hpack/Encoder.zig");
 pub const Field = @import("hpack/Field.zig");
 pub const huffman = @import("hpack/huffman.zig");
 pub const integer = @import("hpack/integer.zig");
@@ -22,6 +23,7 @@ pub const rfc7541_examples = @import("hpack/rfc7541_examples.zig");
 test {
     _ = Decoder;
     _ = DynamicTable;
+    _ = Encoder;
     _ = Field;
     _ = huffman;
     _ = integer;

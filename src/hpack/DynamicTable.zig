@@ -196,7 +196,7 @@ pub fn setCapacity(table: *DynamicTable, capacity: u32) CapacityError!void {
 /// The returned slices point into the arena. See the lifetime note above.
 pub fn get(table: *const DynamicTable, position: u32) ?Field {
     if (position >= table.count) return null;
-    const entry = table.entries[table.slot(position)];
+    const entry = table.entries[table.slotOf(position)];
     // Widened on purpose. The sums are bounded by the arena, but computing
     // them in `u16` makes that bound the *type's* job, and at `capacity_max`
     // the last entry's end is exactly where a `u16` runs out.
@@ -290,7 +290,7 @@ fn evictTo(table: *DynamicTable, limit: u32) void {
     // disagreement would underflow `count - 1` to `maxInt(u32)` and spin. The
     // bound belongs where it cannot be compiled out.
     while (table.count > 0 and table.size > limit) {
-        const oldest = table.entries[table.slot(table.count - 1)];
+        const oldest = table.entries[table.slotOf(table.count - 1)];
         // FIFO means the oldest entry is always at the front of the live span.
         assert(oldest.name_offset == table.begin);
         table.begin += @as(u32, oldest.name_len) + @as(u32, oldest.value_len);
@@ -319,7 +319,7 @@ fn compact(table: *DynamicTable) void {
     const shift = table.begin;
     var position: u32 = 0;
     while (position < table.count) : (position += 1) {
-        const entry = &table.entries[table.slot(position)];
+        const entry = &table.entries[table.slotOf(position)];
         assert(entry.name_offset >= shift);
         entry.name_offset -= @intCast(shift);
     }
@@ -328,7 +328,11 @@ fn compact(table: *DynamicTable) void {
 }
 
 /// Ring index of the entry `position` places back from the newest.
-fn slot(table: *const DynamicTable, position: u32) u32 {
+///
+/// Public because the encoder keeps arrays parallel to `entries` — one hash per
+/// slot — and has to address them the same way this type does. Nothing else
+/// should need it.
+pub fn slotOf(table: *const DynamicTable, position: u32) u32 {
     assert(position < table.count);
     assert(table.entries.len > 0);
     const entries_count: u32 = @intCast(table.entries.len);

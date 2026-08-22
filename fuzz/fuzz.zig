@@ -42,6 +42,16 @@ const list_size_max = 64 * 1024;
 /// Operations in one dynamic-table sequence, so a failing case stays short.
 const operations_max = 64;
 
+/// Blocks per round-trip sequence, and fields per block.
+const blocks_max = 8;
+const fields_max = 16;
+
+/// Room for a block against the text that went into it. A literal costs its
+/// octets plus a few of framing, and Huffman only ever shortens under the
+/// `.if_shorter` default, so three times the drawn text is slack rather than a
+/// bound anything should reach.
+const block_expansion_max = 3;
+
 /// A Huffman decoding cannot exceed 8/5 of its input: the shortest code is five
 /// bits. Four times the input is room to spare, so an `OutputTooLong` from
 /// these targets would be a bug in the bound rather than a small buffer.
@@ -83,6 +93,72 @@ fn fuzzDecoder(_: void, smith: *std.testing.Smith) !void {
     // Whatever the input asked for, the table stayed inside the arena it was
     // given.
     std.debug.assert(decoder.table.size <= decoder.table.capacity);
+}
+
+test "fuzz: hpack round trip" {
+    try std.testing.fuzz({}, fuzzRoundTrip, .{});
+}
+
+/// Encode a drawn header list, decode it back, and require the same fields.
+///
+/// The property is stronger than it looks, because the two sides carry
+/// independent dynamic tables that must evolve identically. A block decodes
+/// correctly only if the encoder's table and the decoder's agree at every
+/// insertion and eviction, so a disagreement of one entry corrupts not this
+/// block but the *next* one — which is why the loop below sends several blocks
+/// through one pair rather than one block through a fresh pair.
+fn fuzzRoundTrip(_: void, smith: *std.testing.Smith) !void {
+    var encoder_storage: hpack.Encoder.Storage(table_capacity) = .{};
+    var encoder = encoder_storage.encoder(.dynamic);
+
+    var decoder_storage: hpack.DynamicTable.Storage(table_capacity) = .{};
+    var decoder = hpack.Decoder.init(decoder_storage.table(), list_size_max);
+
+    var blocks: u32 = 0;
+    while (blocks < blocks_max and !smith.eosWeightedSimple(6, 1)) {
+        blocks += 1;
+
+        var text: [input_max]u8 = undefined;
+        var fields: [fields_max]hpack.Field = undefined;
+        var used: usize = 0;
+        var count: usize = 0;
+        while (count < fields_max and !smith.eosWeightedSimple(8, 1)) {
+            var drawn: [96]u8 = undefined;
+            const length = smith.slice(&drawn);
+            if (used + length > text.len) break;
+            @memcpy(text[used..][0..length], drawn[0..length]);
+
+            const split = if (length == 0) 0 else smith.value(u32) % (length + 1);
+            fields[count] = .{
+                .name = text[used..][0..split],
+                .value = text[used + split ..][0..(length - split)],
+                .never_indexed = smith.value(bool),
+            };
+            used += length;
+            count += 1;
+        }
+
+        var block: [input_max * block_expansion_max]u8 = undefined;
+        const encoded = encoder.encode(&block, fields[0..count]);
+        // A short block is an ordinary outcome, not a failure: the encoder
+        // stops rather than mutating a table for octets it did not write. What
+        // it did write must decode exactly.
+        std.debug.assert(encoded.fields <= count);
+
+        var buffer: [input_max * block_expansion_max]u8 = undefined;
+        var iterator = decoder.iterate(&buffer, block[0..encoded.written]);
+        for (fields[0..encoded.fields]) |want| {
+            const got = (try iterator.next()) orelse unreachable;
+            std.debug.assert(std.mem.eql(u8, want.name, got.name));
+            std.debug.assert(std.mem.eql(u8, want.value, got.value));
+            std.debug.assert(want.never_indexed == got.never_indexed);
+        }
+        std.debug.assert((try iterator.next()) == null);
+
+        // The invariant that keeps a connection decodable past its first block.
+        std.debug.assert(encoder.table.size == decoder.table.size);
+        std.debug.assert(encoder.table.count == decoder.table.count);
+    }
 }
 
 test "fuzz: dynamic table" {

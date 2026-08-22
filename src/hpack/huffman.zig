@@ -255,6 +255,27 @@ fn finish(built: *Machine, tree: *const Tree, node_of_state: *const [states_max]
     assert(!built.accepting[failure]);
 }
 
+/// Code lengths alone, for `encodedLength`.
+///
+/// The full table is 257 entries of eight octets — two kilobytes, touched at a
+/// random offset per input octet. Summing lengths needs only the length, so a
+/// byte per symbol keeps the whole thing in four cache lines instead.
+const code_bits = blk: {
+    @setEvalBranchQuota(10_000);
+    var bits: [256]u8 = undefined;
+    for (&bits, 0..) |*entry, symbol| entry.* = table.codes[symbol].bits;
+    break :blk bits;
+};
+
+comptime {
+    // A byte per length, which holds because no code is longer than 30 bits.
+    assert(bits_max <= std.math.maxInt(u8));
+    // Only the 256 octets, deliberately: EOS has a code but no octet encodes
+    // to it, and including it would make an out-of-range index look valid.
+    assert(code_bits.len == eos);
+    assert(table.codes.len == eos + 1);
+}
+
 const machine = blk: {
     @setEvalBranchQuota(2_000_000);
     break :blk buildMachine();
@@ -324,7 +345,7 @@ pub fn decode(target: []u8, source: []const u8) DecodeError!u32 {
 /// Octets `encode` would write for `source`.
 pub fn encodedLength(source: []const u8) u64 {
     var bits: u64 = 0;
-    for (source) |octet| bits += table.codes[octet].bits;
+    for (source) |octet| bits += code_bits[octet];
     assert(bits >= @as(u64, source.len) * bits_min);
     return std.math.divCeil(u64, bits, 8) catch unreachable;
 }
