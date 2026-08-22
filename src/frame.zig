@@ -11,6 +11,8 @@
 const std = @import("std");
 
 pub const Header = @import("frame/Header.zig");
+pub const payload = @import("frame/payload.zig");
+pub const Payload = payload.Payload;
 pub const Type = Header.Type;
 pub const Flag = Header.Flag;
 pub const ErrorCode = Header.ErrorCode;
@@ -18,4 +20,5 @@ pub const Severity = Header.Severity;
 
 test {
     _ = Header;
+    _ = payload;
 }

@@ -51,22 +51,27 @@ pub const stream_identifier_mask: u32 = 0x7fff_ffff;
 
 /// The fields the wire format is built out of, named so the per-type lengths
 /// below are sums of them rather than numbers that happen to be right.
-const length_octets: u32 = 3;
-const type_octets: u32 = 1;
-const flags_octets: u32 = 1;
+///
+/// Public because `payload.zig` slices by exactly these widths. Two modules
+/// each holding their own idea of how long a promised stream identifier is
+/// would be a frame this one admits and that one reads wrong, so there is one
+/// idea and both read it.
+pub const length_octets: u32 = 3;
+pub const type_octets: u32 = 1;
+pub const flags_octets: u32 = 1;
 /// A stream identifier, and the reserved bit above it.
-const stream_identifier_octets: u32 = 4;
+pub const stream_identifier_octets: u32 = 4;
 /// An error code, wherever one appears in a payload (RFC 9113 section 7).
-const error_code_octets: u32 = 4;
+pub const error_code_octets: u32 = 4;
 /// RFC 9113 section 6.3's priority fields: the exclusive bit and stream
 /// dependency together, then the weight.
-const priority_fields_octets: u32 = stream_identifier_octets + 1;
+pub const priority_fields_octets: u32 = stream_identifier_octets + 1;
 /// The pad length that leads a PADDED payload (sections 6.1, 6.2, 6.6).
-const pad_length_octets: u32 = 1;
+pub const pad_length_octets: u32 = 1;
 /// Section 6.7's opaque payload.
-const ping_payload_octets: u32 = 8;
+pub const ping_payload_octets: u32 = 8;
 /// Section 6.9's window size increment.
-const window_increment_octets: u32 = 4;
+pub const window_increment_octets: u32 = 4;
 
 comptime {
     assert(octets == length_octets + type_octets + flags_octets + stream_identifier_octets);

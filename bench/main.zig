@@ -46,6 +46,7 @@ const date_text = "Mon, 21 Oct 2013 20:13:21 GMT";
 /// rather than a new file with its own timing loop to get subtly wrong.
 const workloads = [_]Workload{
     .{ .name = "frame header", .run = benchFrameHeader },
+    .{ .name = "frame parse", .run = benchFrameParse },
     .{ .name = "hpack decode", .run = benchHpackDecode },
     .{ .name = "hpack encode", .run = benchHpackEncode },
     .{ .name = "hpack encode static", .run = benchHpackEncodeStatic },
@@ -92,15 +93,95 @@ fn benchFrameHeader(iterations: u64) u64 {
     while (index < iterations) : (index += 1) {
         for (frame_headers) |wire| {
             const header = h2.frame.Header.parse(&wire) catch unreachable;
-            header.validate(h2.frame.Header.max_frame_size_min) catch {};
+            // The verdict is consumed, not discarded. A `catch {}` here left
+            // the validation dead and the optimizer free to drop most of it —
+            // which is the exact failure the `Workload` doc warns about, and it
+            // read as a three-times-faster header parse than the real one.
+            const verdict: u64 = if (header.validate(h2.frame.Header.max_frame_size_min))
+                0
+            else |err|
+                @intFromEnum(h2.frame.Header.errorCode(err));
             var rendered: [h2.frame.Header.octets]u8 = undefined;
             _ = h2.frame.Header.render(header, &rendered) catch unreachable;
-            checksum +%= header.length +% rendered[0];
+            checksum +%= header.length +% rendered[0] +% verdict;
             std.mem.doNotOptimizeAway(checksum);
         }
     }
     return checksum;
 }
+
+/// Header and payload together, over whole frames.
+///
+/// The header workload above is the baseline this is read against: the
+/// difference between the two is what walking a payload costs, and it is the
+/// number a later change to either layer has to be compared with.
+fn benchFrameParse(iterations: u64) u64 {
+    assert(iterations >= 1);
+    var checksum: u64 = 0;
+    var index: u64 = 0;
+    while (index < iterations) : (index += 1) {
+        for (frames) |wire| {
+            const header = h2.frame.Header.parse(wire) catch unreachable;
+            header.validate(h2.frame.Header.max_frame_size_min) catch continue;
+            const body = wire[h2.frame.Header.octets..][0..header.length];
+            const payload = h2.frame.payload.parse(header, body) catch continue;
+            checksum +%= switch (payload) {
+                .data => |data| data.data.len,
+                .headers => |headers| headers.fragment.len,
+                .priority => |priority| priority.weight(),
+                .rst_stream => |rst| @intFromEnum(rst.error_code),
+                .settings => |settings| settings.count(),
+                .push_promise => |promise| promise.promised_stream_identifier,
+                .ping => |ping| ping.opaque_data[0],
+                .goaway => |goaway| goaway.debug_data.len,
+                .window_update => |update| update.increment,
+                .continuation => |continuation| continuation.fragment.len,
+                .unknown => |octets| octets.len,
+            };
+            std.mem.doNotOptimizeAway(checksum);
+        }
+    }
+    return checksum;
+}
+
+/// Whole frames, header and payload, of the shapes a connection carries.
+///
+/// Written as string literals rather than octet arrays because most of a real
+/// frame is text — a field block fragment, a debug message — and escaping the
+/// nine binary octets reads better than spelling out thirteen printable ones.
+const frames = [_][]const u8{
+    // SETTINGS with two parameters.
+    "\x00\x00\x0c\x04\x00\x00\x00\x00\x00" ++
+        "\x00\x01\x00\x00\x20\x00" ++ "\x00\x03\x00\x00\x13\x88",
+    // SETTINGS ack.
+    "\x00\x00\x00\x04\x01\x00\x00\x00\x00",
+    // HEADERS carrying a field block fragment.
+    "\x00\x00\x0d\x01\x04\x00\x00\x00\x01" ++ "this is dummy",
+    // HEADERS, padded and prioritized.
+    "\x00\x00\x17\x01\x2c\x00\x00\x00\x03" ++
+        "\x04" ++ "\x80\x00\x00\x14\x09" ++ "this is dummy" ++ "\x00\x00\x00\x00",
+    // DATA, padded.
+    "\x00\x00\x14\x00\x08\x00\x00\x00\x02" ++ "\x06" ++ "Hello, world!" ++ "Howdy!",
+    // PRIORITY.
+    "\x00\x00\x05\x02\x00\x00\x00\x00\x09" ++ "\x00\x00\x00\x0b\x07",
+    // RST_STREAM.
+    "\x00\x00\x04\x03\x00\x00\x00\x00\x05" ++ "\x00\x00\x00\x08",
+    // PING.
+    "\x00\x00\x08\x06\x00\x00\x00\x00\x00" ++ "deadbeef",
+    // GOAWAY with debug data.
+    "\x00\x00\x17\x07\x00\x00\x00\x00\x00" ++
+        "\x00\x00\x00\x1e\x00\x00\x00\x09" ++ "hpack is broken",
+    // WINDOW_UPDATE.
+    "\x00\x00\x04\x08\x00\x00\x00\x00\x32" ++ "\x00\x00\x03\xe8",
+    // CONTINUATION.
+    "\x00\x00\x0d\x09\x00\x00\x00\x00\x32" ++ "this is dummy",
+    // An unknown type, skipped by its length.
+    "\x00\x00\x03\xfa\xff\x00\x00\x00\x07" ++ "\x01\x02\x03",
+    // And two that fail, so the error paths are in the mix a connection sees
+    // rather than measured only on frames that succeed.
+    "\x00\x00\x04\x08\x00\x00\x00\x00\x05" ++ "\x00\x00\x00\x00",
+    "\x00\x00\x04\x00\x08\x00\x00\x00\x01" ++ "\x04\x00\x00\x00",
+};
 
 /// The first nine octets of a spread of real frames: every type, valid and
 /// malformed, so branch prediction sees the same mix a connection does rather

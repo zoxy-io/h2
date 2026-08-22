@@ -199,9 +199,16 @@ test "no valid fixture is rejected, and every rejection is one the fixture allow
 
         const expects_error = parsed.value.object.get("frame").? == .null;
         if (!expects_error) {
-            // A frame the corpus calls well-formed must survive validation.
+            // A frame the corpus calls well-formed must survive both layers.
             header.validate(max_frame_size) catch |err| {
-                std.debug.print("{s}/{s}: rejected a valid frame as {t}\n", .{
+                std.debug.print("{s}/{s}: header rejected a valid frame as {t}\n", .{
+                    fixture.category, fixture.name, err,
+                });
+                return err;
+            };
+            const body = wire[frame.Header.octets..][0..header.length];
+            _ = frame.payload.parse(header, body) catch |err| {
+                std.debug.print("{s}/{s}: payload rejected a valid frame as {t}\n", .{
                     fixture.category, fixture.name, err,
                 });
                 return err;
@@ -209,44 +216,188 @@ test "no valid fixture is rejected, and every rejection is one the fixture allow
             continue;
         }
 
-        header.validate(max_frame_size) catch |err| {
+        const got: ?u32 = blk: {
+            header.validate(max_frame_size) catch |err| {
+                break :blk @intFromEnum(frame.Header.errorCode(err));
+            };
+            const body = wire[frame.Header.octets..][0..header.length];
+            _ = frame.payload.parse(header, body) catch |err| {
+                break :blk @intFromEnum(frame.payload.errorCode(err));
+            };
+            break :blk null;
+        };
+
+        if (got) |code| {
             // The code has to be one the fixture accepts. Some name more than
             // one: push_promise-frame-padding allows PROTOCOL_ERROR or
             // FRAME_SIZE_ERROR, so a test demanding a single code would be
             // wrong about it and right about the other twenty-one.
-            const got = @intFromEnum(frame.Header.errorCode(err));
             const codes = parsed.value.object.get("error").?.array;
             var accepted = false;
-            for (codes.items) |code| {
-                if (@as(u32, @intCast(code.integer)) == got) accepted = true;
+            for (codes.items) |allowed| {
+                if (@as(u32, @intCast(allowed.integer)) == code) accepted = true;
             }
             if (!accepted) {
                 std.debug.print("{s}/{s}: returned code {d}, fixture allows", .{
-                    fixture.category, fixture.name, got,
+                    fixture.category, fixture.name, code,
                 });
-                for (codes.items) |code| std.debug.print(" {d}", .{code.integer});
+                for (codes.items) |allowed| std.debug.print(" {d}", .{allowed.integer});
                 std.debug.print("\n", .{});
                 return error.TestUnexpectedResult;
             }
             caught += 1;
             continue;
-        };
-        // Not caught by the header alone, which is expected for the rules that
-        // live in a payload.
+        }
+
+        std.debug.print("{s}/{s}: accepted a frame the corpus rejects\n", .{
+            fixture.category, fixture.name,
+        });
         uncaught += 1;
     }
 
-    // Pinned so the split can only move deliberately, and it should only move
-    // one way. The five still uncaught each need an octet of payload: the pad
-    // length of a DATA and a HEADERS frame checked against what is left, the
-    // parity and non-zeroness of a promised stream identifier, and a
-    // WINDOW_UPDATE increment of zero.
-    //
-    // `push_promise-frame-padding` is caught here rather than there, because a
-    // PADDED PUSH_PROMISE shorter than five octets cannot hold its pad length
-    // and its promised stream. Its fixture accepts PROTOCOL_ERROR or
-    // FRAME_SIZE_ERROR and this returns the second, which is the reason the
-    // check above tests membership rather than equality.
-    try std.testing.expectEqual(@as(u32, 17), caught);
-    try std.testing.expectEqual(@as(u32, 5), uncaught);
+    // Every error case the corpus carries, now that the payload layer exists.
+    // Seventeen were reachable from the nine-octet header alone; the last five
+    // needed an octet of payload each.
+    try std.testing.expectEqual(@as(u32, 22), caught);
+    try std.testing.expectEqual(@as(u32, 0), uncaught);
+}
+
+test "every valid fixture's payload decodes to the fields it declares" {
+    const allocator = std.testing.allocator;
+
+    var checked: u32 = 0;
+    for (fixtures) |fixture| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, fixture.json, .{});
+        defer parsed.deinit();
+
+        const frame_value = parsed.value.object.get("frame").?;
+        if (frame_value == .null) continue;
+
+        var buffer: [wire_max]u8 = undefined;
+        const hex = parsed.value.object.get("wire").?.string;
+        const wire = try std.fmt.hexToBytes(&buffer, hex);
+        const header = try frame.Header.parse(wire);
+        const body = wire[frame.Header.octets..][0..header.length];
+        const payload = try frame.payload.parse(header, body);
+
+        const want = frame_value.object.get("frame_payload").?.object;
+        checkPayload(&want, &payload) catch |err| {
+            std.debug.print("{s}/{s}: payload\n", .{ fixture.category, fixture.name });
+            return err;
+        };
+        checked += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 12), checked);
+}
+
+/// Compare one decoded payload against what the fixture says it holds.
+///
+/// The corpus records a `frame_payload` for every valid frame and nothing read
+/// it until now, which meant the whole payload half of the corpus was vendored
+/// and unspent.
+fn checkPayload(want: *const std.json.ObjectMap, got: *const frame.Payload) !void {
+    switch (got.*) {
+        .data => |data| {
+            try std.testing.expectEqualStrings(want.get("data").?.string, data.data);
+            try expectPadding(want, data.padding);
+        },
+        .headers => |headers| {
+            try expectFragment(want, headers.fragment);
+            try expectPadding(want, headers.padding);
+            if (want.get("stream_dependency").? == .null) {
+                try std.testing.expectEqual(@as(?frame.payload.Priority, null), headers.priority);
+            } else {
+                try expectPriority(want, headers.priority.?);
+            }
+        },
+        .priority => |priority| try expectPriority(want, priority),
+        .rst_stream => |rst| {
+            try std.testing.expectEqual(
+                @as(u32, @intCast(want.get("error_code").?.integer)),
+                @intFromEnum(rst.error_code),
+            );
+        },
+        .settings => |settings| {
+            const entries = want.get("settings").?.array;
+            try std.testing.expectEqual(@as(u32, @intCast(entries.items.len)), settings.count());
+            var iterator = settings.iterate();
+            for (entries.items) |entry| {
+                const pair = entry.array;
+                const decoded = iterator.next().?;
+                try std.testing.expectEqual(
+                    @as(u16, @intCast(pair.items[0].integer)),
+                    @intFromEnum(decoded.identifier),
+                );
+                try std.testing.expectEqual(
+                    @as(u32, @intCast(pair.items[1].integer)),
+                    decoded.value,
+                );
+            }
+            try std.testing.expectEqual(@as(?frame.payload.Settings.Entry, null), iterator.next());
+        },
+        .push_promise => |promise| {
+            try std.testing.expectEqual(
+                @as(u31, @intCast(want.get("promised_stream_id").?.integer)),
+                promise.promised_stream_identifier,
+            );
+            try expectFragment(want, promise.fragment);
+            try expectPadding(want, promise.padding);
+        },
+        .ping => |ping| {
+            try std.testing.expectEqualStrings(want.get("opaque_data").?.string, ping.opaque_data);
+        },
+        .goaway => |goaway| {
+            try std.testing.expectEqual(
+                @as(u31, @intCast(want.get("last_stream_id").?.integer)),
+                goaway.last_stream_identifier,
+            );
+            try std.testing.expectEqual(
+                @as(u32, @intCast(want.get("error_code").?.integer)),
+                @intFromEnum(goaway.error_code),
+            );
+            try std.testing.expectEqualStrings(
+                want.get("additional_debug_data").?.string,
+                goaway.debug_data,
+            );
+        },
+        .window_update => |update| {
+            try std.testing.expectEqual(
+                @as(u31, @intCast(want.get("window_size_increment").?.integer)),
+                update.increment,
+            );
+        },
+        .continuation => |continuation| try expectFragment(want, continuation.fragment),
+        .unknown => return error.TestUnexpectedResult,
+    }
+}
+
+fn expectFragment(want: *const std.json.ObjectMap, fragment: []const u8) !void {
+    try std.testing.expectEqualStrings(want.get("header_block_fragment").?.string, fragment);
+}
+
+/// The corpus records the *weight*, not the wire octet — RFC 9113 section 6.3
+/// adds one. Both priority fixtures agree on that, which is how the codec's
+/// original reading was caught.
+fn expectPriority(want: *const std.json.ObjectMap, priority: frame.payload.Priority) !void {
+    try std.testing.expectEqual(
+        @as(u31, @intCast(want.get("stream_dependency").?.integer)),
+        priority.stream_dependency,
+    );
+    try std.testing.expectEqual(
+        @as(u16, @intCast(want.get("weight").?.integer)),
+        priority.weight(),
+    );
+    try std.testing.expectEqual(want.get("exclusive").?.bool, priority.exclusive);
+}
+
+/// The corpus records a padding length and the padding itself, or null for
+/// both when the frame is not padded.
+fn expectPadding(want: *const std.json.ObjectMap, padding: []const u8) !void {
+    const length = want.get("padding_length") orelse return;
+    if (length == .null) {
+        try std.testing.expectEqual(@as(usize, 0), padding.len);
+        return;
+    }
+    try std.testing.expectEqual(@as(usize, @intCast(length.integer)), padding.len);
+    try std.testing.expectEqualStrings(want.get("padding").?.string, padding);
 }

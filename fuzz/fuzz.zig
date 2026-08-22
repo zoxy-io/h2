@@ -105,6 +105,88 @@ fn fuzzFrameHeader(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
+test "fuzz: frame payload" {
+    try std.testing.fuzz({}, fuzzFramePayload, .{});
+}
+
+/// Draw a whole frame and parse both layers.
+///
+/// The header target above stops at nine octets, so nothing reached the payload
+/// codec — and the first bug found there was exactly the shape this catches: a
+/// HEADERS frame whose header passes its minimum-length rule and whose padding
+/// then swallows the priority fields, which was an assertion rather than a
+/// check. Fifteen octets, and the assertion is its own oracle.
+///
+/// Beyond reject-or-parse: every slice handed back must lie inside the payload
+/// it was parsed from. A codec that borrows is only safe if it borrows from
+/// where it says it does.
+fn fuzzFramePayload(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [input_max]u8 = undefined;
+    const length = smith.slice(&buffer);
+    if (length < frame.Header.octets) return;
+
+    // Make the declared length agree with the octets actually drawn, so the
+    // draw spends its entropy on payload shapes rather than on lengths that
+    // cannot be satisfied.
+    const body_length: u32 = @intCast(length - frame.Header.octets);
+    buffer[0] = @truncate(body_length >> 16);
+    buffer[1] = @truncate(body_length >> 8);
+    buffer[2] = @truncate(body_length);
+
+    const wire = buffer[0..length];
+    const header = frame.Header.parse(wire) catch unreachable;
+    std.debug.assert(header.length == body_length);
+    header.validate(frame.Header.max_frame_size_min) catch return;
+
+    const body = wire[frame.Header.octets..][0..header.length];
+    const payload = frame.payload.parse(header, body) catch |err| {
+        // Severity is answerable for every failure this layer produces.
+        _ = frame.payload.errorCode(err);
+        return;
+    };
+
+    // Everything borrowed points into the payload it came from.
+    switch (payload) {
+        .data => |data| {
+            assertBorrowed(body, data.data);
+            assertBorrowed(body, data.padding);
+        },
+        .headers => |headers| {
+            assertBorrowed(body, headers.fragment);
+            assertBorrowed(body, headers.padding);
+        },
+        .push_promise => |promise| {
+            assertBorrowed(body, promise.fragment);
+            assertBorrowed(body, promise.padding);
+            // Section 5.1.1, restated where a parse could get it wrong.
+            std.debug.assert(promise.promised_stream_identifier % 2 == 0);
+            std.debug.assert(promise.promised_stream_identifier != 0);
+        },
+        .goaway => |goaway| assertBorrowed(body, goaway.debug_data),
+        .continuation => |continuation| assertBorrowed(body, continuation.fragment),
+        .settings => |settings| {
+            assertBorrowed(body, settings.entries);
+            var iterator = settings.iterate();
+            var seen: u32 = 0;
+            while (iterator.next()) |_| seen += 1;
+            std.debug.assert(seen == settings.count());
+        },
+        .ping => |ping| assertBorrowed(body, ping.opaque_data),
+        .window_update => |update| std.debug.assert(update.increment != 0),
+        .unknown => |octets| assertBorrowed(body, octets),
+        .priority, .rst_stream => {},
+    }
+}
+
+/// A slice lies within `owner`, empty ones included.
+fn assertBorrowed(owner: []const u8, borrowed: []const u8) void {
+    if (borrowed.len == 0) return;
+    const owner_begin = @intFromPtr(owner.ptr);
+    const begin = @intFromPtr(borrowed.ptr);
+    std.debug.assert(begin >= owner_begin);
+    std.debug.assert(begin + borrowed.len <= owner_begin + owner.len);
+}
+
 test "fuzz: hpack decoder" {
     try std.testing.fuzz({}, fuzzDecoder, .{});
 }
