@@ -109,17 +109,35 @@ pub fn build(b: *std.Build) void {
     const corpus_step = b.step("corpus", "Vendored corpora: HPACK interop and HTTP/2 frame fixtures");
     corpus_step.dependOn(&corpus_run.step);
 
+    // The README's usage example, compiled and run. A usage example that is
+    // only prose rots the first time a signature changes, and the first thing a
+    // reader tries is the thing that no longer builds.
+    const example_exe = b.addExecutable(.{
+        .name = "h2-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("example/receive.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "h2", .module = h2_module }},
+        }),
+    });
+    const example_run = b.addRunArtifact(example_exe);
+    const example_step = b.step("example", "Build and run the README's usage example");
+    example_step.dependOn(&example_run.step);
+
     const test_step = b.step("test", "Run unit tests, the lint's own tests, and the fuzz corpus");
     test_step.dependOn(&module_tests.step);
     test_step.dependOn(&lint_tests.step);
     // A corpus replayed only under `zig build fuzz` is a corpus that rots.
     test_step.dependOn(&fuzz_run.step);
     test_step.dependOn(&corpus_run.step);
+    // So that `zig build ci` fails on a README example that stopped compiling.
+    test_step.dependOn(&example_run.step);
 
     // The format gate. A build step rather than a documented `zig fmt --check`
     // incantation, so that the list of formatted paths lives in exactly one
     // place and CI cannot check a different set than a developer does.
-    const fmt_paths = &.{ "src", "scripts", "bench", "fuzz", "corpus/all.zig", "corpus/hpack.zig", "corpus/frames.zig", "build.zig", "build.zig.zon" };
+    const fmt_paths = &.{ "src", "scripts", "bench", "fuzz", "example", "corpus/all.zig", "corpus/hpack.zig", "corpus/frames.zig", "build.zig", "build.zig.zon" };
     const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
     const fmt_step = b.step("fmt", "Check formatting (zig build fmt-fix rewrites)");
     fmt_step.dependOn(&fmt_check.step);

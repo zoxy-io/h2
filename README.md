@@ -29,17 +29,59 @@ stay in the consumer.
 * Never copies where a slice will do.
 * Caller-owned, caller-sized buffers, including HPACK's dynamic table.
 * Zero dependencies beyond the Zig toolchain.
+* Bytes in, frames and header fields out — no reader, writer or `std.Io` in the
+  seam. Its two consumers, [zoxy](https://github.com/zoxy-io/zoxy) (reverse
+  proxy, libxev completion callbacks) and
+  [zrk](https://github.com/zoxy-io/zrk) (load generator, zio green threads
+  through `std.Io`), do not share a runtime, so a reader in a signature would
+  exclude one of them. `zig build lint` enforces it.
 
-## Consumers
+## Usage
 
-* [zoxy](https://github.com/zoxy-io/zoxy) — reverse proxy, drives libxev
-  completion callbacks.
-* [zrk](https://github.com/zoxy-io/zrk) — load generator, drives zio green
-  threads through `std.Io`.
+The receive path, end to end — a frame header, its payload, a field block spread
+across CONTINUATION frames, HPACK, and the RFC 9113 §8 rules that decide whether
+the result is a message at all:
 
-They do not share a runtime, which is why the API is bytes in, frames and
-header fields out: a reader or writer in the seam would exclude one of them.
-`zig build lint` enforces it.
+```zig
+const h2 = @import("h2");
+
+var assembler: h2.frame.BlockAssembler = .init(&block_buffer, 16);
+var decoder: h2.hpack.Decoder = .init(hpack_storage.table(), list_size_max);
+
+// 1. The nine octets, and everything they can decide on their own.
+const header = try h2.frame.Header.parse(wire[offset..]);
+try header.validate(max_frame_size);
+
+// 2. The payload, sliced by the length the header declared.
+const payload = try h2.frame.payload.parse(header, body);
+
+// 3. The CONTINUATION state machine: was this frame allowed to arrive?
+const block = switch (try assembler.accept(header, &payload)) {
+    .passthrough, .fragment => continue,
+    .block => |complete| complete,
+};
+
+// 4. HPACK and the §8 rules, in one pass. The decoder is an iterator and the
+//    validator is fed one field at a time, because a field's slices borrow
+//    from `field_buffer` and the next field may reuse it.
+var validator: h2.fields.MessageValidator = .init(.{ .kind = .request, .rules = .strict });
+var iterator = decoder.iterate(&field_buffer, block.fragment);
+while (try iterator.next()) |field| {
+    try validator.field(&field);
+    // ... field.name, field.value
+}
+try validator.finish();
+```
+
+[`example/receive.zig`](example/receive.zig) is the whole thing, including the
+send path that produces the octets it reads back. It is a compiled, run program
+rather than a snippet — `zig build example`, and `zig build ci` runs it — so a
+usage example that stopped building fails the build instead of greeting the next
+reader.
+
+Nothing above allocates. Every buffer is caller-owned and caller-sized, and
+every size traces to a setting or an RFC clause: `block_buffer`'s length *is*
+the bound on a field block, which is what stops the CONTINUATION flood.
 
 ## Gates
 
@@ -49,6 +91,7 @@ zig build bench   # decode/encode microbenchmarks (ReleaseFast)
 zig build fuzz    # replay the fuzz corpus; --fuzz to actually fuzz
 zig build corpus  # interoperability conformance against other implementations
 zig build fmt-fix # reformat in place
+zig build example # build and run the usage example above
 ```
 
 CI runs `zig build ci` natively on each target, so the tests run rather than
