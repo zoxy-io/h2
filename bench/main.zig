@@ -45,6 +45,7 @@ const date_text = "Mon, 21 Oct 2013 20:13:21 GMT";
 /// Workloads are registered here and nowhere else, so adding one is a row
 /// rather than a new file with its own timing loop to get subtly wrong.
 const workloads = [_]Workload{
+    .{ .name = "frame header", .run = benchFrameHeader },
     .{ .name = "hpack decode", .run = benchHpackDecode },
     .{ .name = "hpack encode", .run = benchHpackEncode },
     .{ .name = "hpack encode static", .run = benchHpackEncodeStatic },
@@ -75,6 +76,51 @@ const Result = struct {
     min_ns: u64,
     mean_ns: u64,
     max_ns: u64,
+};
+
+/// Parse, validate and render every frame header in the vendored fixtures.
+///
+/// Nine octets of shifts is not where a proxy spends its time, and this number
+/// is not here to be optimized. It is here as the baseline the payload codec
+/// will be measured against: when parsing a frame stops being a header read and
+/// starts being a header read plus a payload walk, the difference is the thing
+/// worth knowing, and it cannot be recovered afterwards.
+fn benchFrameHeader(iterations: u64) u64 {
+    assert(iterations >= 1);
+    var checksum: u64 = 0;
+    var index: u64 = 0;
+    while (index < iterations) : (index += 1) {
+        for (frame_headers) |wire| {
+            const header = h2.frame.Header.parse(&wire) catch unreachable;
+            header.validate(h2.frame.Header.max_frame_size_min) catch {};
+            var rendered: [h2.frame.Header.octets]u8 = undefined;
+            _ = h2.frame.Header.render(header, &rendered) catch unreachable;
+            checksum +%= header.length +% rendered[0];
+            std.mem.doNotOptimizeAway(checksum);
+        }
+    }
+    return checksum;
+}
+
+/// The first nine octets of a spread of real frames: every type, valid and
+/// malformed, so branch prediction sees the same mix a connection does rather
+/// than one shape repeated.
+const frame_headers = [_][h2.frame.Header.octets]u8{
+    .{ 0x00, 0x00, 0x0c, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00 }, // SETTINGS
+    .{ 0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00 }, // SETTINGS ack
+    .{ 0x00, 0x00, 0x14, 0x01, 0x04, 0x00, 0x00, 0x00, 0x01 }, // HEADERS
+    .{ 0x00, 0x00, 0x23, 0x01, 0x2c, 0x00, 0x00, 0x00, 0x03 }, // HEADERS, padded and prioritized
+    .{ 0x00, 0x00, 0x14, 0x00, 0x08, 0x00, 0x00, 0x00, 0x02 }, // DATA, padded
+    .{ 0x00, 0x00, 0x05, 0x02, 0x00, 0x00, 0x00, 0x00, 0x09 }, // PRIORITY
+    .{ 0x00, 0x00, 0x04, 0x03, 0x00, 0x00, 0x00, 0x00, 0x05 }, // RST_STREAM
+    .{ 0x00, 0x00, 0x08, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00 }, // PING
+    .{ 0x00, 0x00, 0x17, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00 }, // GOAWAY
+    .{ 0x00, 0x00, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x32 }, // WINDOW_UPDATE
+    .{ 0x00, 0x00, 0x0d, 0x09, 0x00, 0x00, 0x00, 0x00, 0x32 }, // CONTINUATION
+    .{ 0x00, 0x00, 0x04, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00 }, // GOAWAY, too short
+    .{ 0x00, 0x00, 0x06, 0x02, 0x00, 0x00, 0x00, 0x00, 0x09 }, // PRIORITY, wrong length
+    .{ 0x00, 0x00, 0x0c, 0x04, 0x00, 0x00, 0x00, 0x00, 0x03 }, // SETTINGS on a stream
+    .{ 0x00, 0x00, 0x10, 0xfa, 0xff, 0x00, 0x00, 0x00, 0x07 }, // an unknown type
 };
 
 /// Decode every Appendix C header block, each story against a fresh

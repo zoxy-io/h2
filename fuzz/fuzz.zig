@@ -26,6 +26,7 @@ const std = @import("std");
 
 const h2 = @import("h2");
 
+const frame = h2.frame;
 const hpack = h2.hpack;
 
 /// Inputs are capped so a failing case stays small enough to read.
@@ -56,6 +57,53 @@ const block_expansion_max = 3;
 /// bits. Four times the input is room to spare, so an `OutputTooLong` from
 /// these targets would be a bug in the bound rather than a small buffer.
 const huffman_expansion_max = 4;
+
+test "fuzz: frame header" {
+    try std.testing.fuzz({}, fuzzFrameHeader, .{});
+}
+
+/// Parse, render and validate a frame header drawn from arbitrary octets.
+///
+/// Three properties. Parsing nine octets never fails and never panics — every
+/// bit pattern is a syntactically valid header, because the type and flag
+/// fields are deliberately open. Rendering reproduces the octets it read,
+/// except the reserved bit, which section 4.1 requires be ignored on receipt
+/// and sent as zero. And `validate` reaches a decision for every header and
+/// every legal `SETTINGS_MAX_FRAME_SIZE`, rather than asserting its way out of
+/// one.
+fn fuzzFrameHeader(_: void, smith: *std.testing.Smith) !void {
+    var wire: [frame.Header.octets]u8 = undefined;
+    smith.bytes(&wire);
+
+    const header = frame.Header.parse(&wire) catch unreachable;
+
+    var rendered: [frame.Header.octets]u8 = undefined;
+    _ = frame.Header.render(header, &rendered) catch unreachable;
+    var expected = wire;
+    // The one octet that legitimately differs: the reserved bit is ignored on
+    // receipt and sent as zero. The mask is the codec's own, so this cannot
+    // drift from what `parse` actually does.
+    expected[5] &= @truncate(frame.Header.stream_identifier_mask >> 24);
+    std.debug.assert(std.mem.eql(u8, &expected, &rendered));
+
+    // Any value a peer could legally advertise, so the bound itself is drawn
+    // rather than fixed at the floor.
+    const span = frame.Header.max_frame_size_max - frame.Header.max_frame_size_min;
+    const max_frame_size = frame.Header.max_frame_size_min + smith.value(u32) % (span + 1);
+    if (header.validate(max_frame_size)) {
+        // A header that validates is one whose length fits the bound, whatever
+        // else it says.
+        std.debug.assert(header.length <= max_frame_size);
+    } else |err| {
+        const code = @intFromEnum(frame.Header.errorCode(err));
+        std.debug.assert(code == 0x01 or code == 0x06);
+        // Severity is decidable for every failure, and a stream error needs a
+        // stream: nothing on stream zero may be answered with RST_STREAM.
+        const how = header.severity(err);
+        if (header.stream_identifier == 0) std.debug.assert(how == .connection);
+        if (err == error.Protocol) std.debug.assert(how == .connection);
+    }
+}
 
 test "fuzz: hpack decoder" {
     try std.testing.fuzz({}, fuzzDecoder, .{});

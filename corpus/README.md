@@ -116,13 +116,37 @@ single code would be wrong.
 ignored rather than rejected; frames exceeding `SETTINGS_MAX_FRAME_SIZE`, since
 a fixture cannot know what was negotiated; and the CONTINUATION flood, which is
 a property of a sequence rather than of one frame. Those need tests this package
-writes itself.
+writes itself; the first two now have them in `src/frame/Header.zig`, and the
+third waits on a connection layer.
+
+Nor does any fixture record a failure's **severity** — whether it ends the
+connection or only the stream. RFC 9113 makes a wrong-length PRIORITY frame a
+stream error and a wrong-length RST_STREAM a connection error, and the corpus
+names codes, not severities. `Header.severity` is covered by unit tests only.
 
 ## Status
 
-`corpus/frames.zig` today checks that every fixture's declared metadata agrees
-with its own octets — length, type, flags and stream identifier read back out of
-the wire. That guards the vendored data and records a reading of the nine-octet
-header independent of `src/`, so the codec is built against an expectation that
-already exists. The conformance gate proper, decoding these with the codec and
-comparing payloads and error codes, arrives with #2's first slice.
+`corpus/frames.zig` checks every fixture three ways: the codec's `Header.parse`
+against the fixture's declared metadata, the codec against an independent
+reading of the nine octets that was written before it and does not import it,
+and `Header.validate` against the fixture's expected error codes.
+
+**Seventeen of the twenty-two error cases are caught by the header alone**, and
+the split is pinned in the test so it can only move deliberately. The five that
+remain each need an octet of payload, and arrive with the payload codec:
+
+| fixture | needs |
+|---|---|
+| `data-frame-padding`, `headers-frame-padding` | the pad length, checked against what is left |
+| `push_promise-frame-promised_stream-odd`, `-zero` | the promised stream identifier's parity |
+| `window_update-frame-increment` | the increment, which must not be zero |
+
+`push_promise-frame-padding` is caught by the header, because a PADDED
+PUSH_PROMISE shorter than five octets cannot hold both its pad length and its
+promised stream identifier. It is also the fixture that accepts *two* error
+codes, and the codec returns `FRAME_SIZE_ERROR` where a reader might expect
+`PROTOCOL_ERROR` — which is why the test checks membership rather than
+equality. A test written the obvious way would fail on it and be wrong.
+
+Payload comparison is still absent: the fixtures carry decoded payloads
+(`frame_payload`) that nothing yet reads.

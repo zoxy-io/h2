@@ -7,8 +7,10 @@
 
 const std = @import("std");
 
+pub const frame = @import("frame.zig");
 pub const hpack = @import("hpack.zig");
 
 test {
+    _ = frame;
     _ = hpack;
 }
