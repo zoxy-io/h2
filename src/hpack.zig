@@ -12,6 +12,7 @@ pub const DynamicTable = @import("hpack/DynamicTable.zig");
 pub const Field = @import("hpack/Field.zig");
 pub const huffman = @import("hpack/huffman.zig");
 pub const integer = @import("hpack/integer.zig");
+pub const memory = @import("hpack/memory.zig");
 pub const static_table = @import("hpack/static_table.zig");
 
 /// RFC 7541 Appendix C, machine-extracted. Public so a consumer can run the
@@ -24,6 +25,7 @@ test {
     _ = Field;
     _ = huffman;
     _ = integer;
+    _ = memory;
     _ = static_table;
     _ = rfc7541_examples;
 }

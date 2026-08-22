@@ -39,6 +39,9 @@ const table_capacity = 4096;
 const output_max = 2048;
 const list_size_max = 64 * 1024;
 
+/// Operations in one dynamic-table sequence, so a failing case stays short.
+const operations_max = 64;
+
 /// A Huffman decoding cannot exceed 8/5 of its input: the shortest code is five
 /// bits. Four times the input is room to spare, so an `OutputTooLong` from
 /// these targets would be a bug in the bound rather than a small buffer.
@@ -80,6 +83,58 @@ fn fuzzDecoder(_: void, smith: *std.testing.Smith) !void {
     // Whatever the input asked for, the table stayed inside the arena it was
     // given.
     std.debug.assert(decoder.table.size <= decoder.table.capacity);
+}
+
+test "fuzz: dynamic table" {
+    try std.testing.fuzz({}, fuzzDynamicTable, .{});
+}
+
+/// The dynamic table's state machine directly, at `capacity_max` rather than
+/// at a comfortable 4 KiB.
+///
+/// The decoder target above reaches this type only through whatever a header
+/// block can express, and every other test in the package uses a small table.
+/// That is how a `u16` offset overflow at exactly `capacity_max` survived a
+/// review and a full test suite: the arithmetic is only wrong at the top of the
+/// range, and nothing went there. The ring, the live span and the rebase all
+/// interact here, so this drives them as a sequence rather than as one call.
+fn fuzzDynamicTable(_: void, smith: *std.testing.Smith) !void {
+    var storage: hpack.DynamicTable.Storage(hpack.DynamicTable.capacity_max) = .{};
+    var table = storage.table();
+
+    var operations: u32 = 0;
+    // Bounded by the draw: `eos` ends it, and the counter caps a run the smith
+    // decides not to end.
+    while (operations < operations_max and !smith.eosWeightedSimple(24, 1)) {
+        operations += 1;
+        switch (smith.value(enum { insert, resize, read, clear })) {
+            .insert => {
+                var octets: [input_max]u8 = undefined;
+                const length = smith.slice(&octets);
+                const split = if (length == 0) 0 else smith.value(u16) % length;
+                table.insert(.{ .name = octets[0..split], .value = octets[split..length] });
+            },
+            .resize => {
+                const capacity = smith.value(u32) % (hpack.DynamicTable.capacity_max + 1);
+                table.setCapacity(capacity) catch {};
+            },
+            .read => {
+                var position: u32 = 0;
+                while (position < table.count) : (position += 1) {
+                    const field = table.get(position).?;
+                    std.mem.doNotOptimizeAway(field.name.len);
+                    std.mem.doNotOptimizeAway(field.value.len);
+                }
+            },
+            .clear => table.clear(),
+        }
+
+        // The span invariants, which every operation above has to preserve.
+        std.debug.assert(table.size <= table.capacity);
+        std.debug.assert(table.begin <= table.end);
+        std.debug.assert(table.end <= table.arena.len);
+        if (table.count == 0) std.debug.assert(table.begin == table.end);
+    }
 }
 
 test "fuzz: huffman decoder" {

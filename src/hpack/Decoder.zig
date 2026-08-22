@@ -63,6 +63,7 @@ const DynamicTable = @import("DynamicTable.zig");
 const Field = @import("Field.zig");
 const huffman = @import("huffman.zig");
 const integer = @import("integer.zig");
+const memory = @import("memory.zig");
 const static_table = @import("static_table.zig");
 
 /// Consecutive dynamic table size updates allowed at the start of a block.
@@ -145,18 +146,8 @@ pub fn iterate(decoder: *Decoder, buffer: []u8, block: []const u8) Iterator {
     // rather than restrictive.
     assert(block.len <= std.math.maxInt(u32));
     assert(buffer.len <= std.math.maxInt(u32));
-    assert(!overlaps(buffer, decoder.table.arena));
+    assert(!memory.overlaps(buffer, decoder.table.arena));
     return .{ .decoder = decoder, .buffer = buffer, .block = block };
-}
-
-/// True when two spans share any octet. `DynamicTable.insert` asserts the
-/// mirror image of this from its own side; between them, no copy in this
-/// package can be a `@memcpy` over itself.
-fn overlaps(left: []const u8, right: []const u8) bool {
-    if (left.len == 0 or right.len == 0) return false;
-    const left_begin = @intFromPtr(left.ptr);
-    const right_begin = @intFromPtr(right.ptr);
-    return left_begin < right_begin + right.len and right_begin < left_begin + left.len;
 }
 
 pub const Iterator = struct {
@@ -406,7 +397,7 @@ pub const Iterator = struct {
         const target = iterator.buffer[iterator.used..][0..bytes.len];
         // `iterate` asserts the buffer and the arena are disjoint, which is what
         // makes this hold for every source this function is called with.
-        assert(!overlaps(target, bytes));
+        assert(!memory.overlaps(target, bytes));
         @memcpy(target, bytes);
         iterator.used += @intCast(bytes.len);
         assert(iterator.used <= iterator.buffer.len);

@@ -28,9 +28,23 @@
 //! the capacity to stay contiguous on read, and the capacity is the number a
 //! consumer writes its memory budget in.
 //!
-//! Compaction is amortized: it moves at most `capacity` bytes and cannot
-//! recur until insertions have walked the write cursor to the end of the arena
-//! again, which costs about one byte moved per byte stored.
+//! Compaction is amortized but not free, and the constant is worth stating
+//! honestly rather than as "about one". A compaction moves the live span, `L`
+//! octets, and leaves the write cursor at `L` — so the next one cannot happen
+//! until another `C - L` octets have been inserted, where `C` is the arena.
+//! That is `L / (C - L)` octets moved per octet stored, and `L` is a peer's
+//! choice: it picks the header sizes.
+//!
+//! At the 4 KiB default the worst shape a peer can pick is entries of roughly
+//! 260 octets, giving 13 live entries, 3380 live octets, and one compaction
+//! every two inserts — about 6.5x. At `capacity_max` it is worse: entries of
+//! roughly 1600 octets give 40 live and a compaction on *every* insert, moving
+//! 64000 octets to store 1600, about 40x.
+//!
+//! Both are constant factors, so the amortization holds and the work stays
+//! O(1) per insert. It is memory bandwidth rather than an unbounded loop. But
+//! it is the reason a consumer sizes this table for its traffic instead of
+//! handing over `capacity_max` because it can.
 //!
 //! ## Lifetime
 //!
@@ -46,14 +60,33 @@ const DynamicTable = @This();
 const assert = std.debug.assert;
 
 const Field = @import("Field.zig");
+const memory = @import("memory.zig");
 
-/// The largest table this type will hold, so that an offset fits `u16`.
+/// The largest table this type will hold.
 ///
 /// A bound is needed regardless — an unbounded `SETTINGS_HEADER_TABLE_SIZE`
 /// from a peer is memory a peer chose for us — and 64 KiB is far past any
-/// useful table. The Rust h2 crate lands on the same number. Consumers set
-/// their real limit lower by handing over a smaller arena.
-pub const capacity_max: u32 = 65536;
+/// useful table. Consumers set their real limit lower by handing over a
+/// smaller arena.
+///
+/// It is `maxInt(u16)` and not the 65536 it reads like it wants to be, because
+/// the offsets an arena of N octets needs are `0..N` inclusive, not `0..N-1`:
+/// `end` is a one-past-the-end cursor that becomes the next entry's
+/// `name_offset`, and `get` recomputes a span's end from it. At 65536 both of
+/// those reach 65536, which is one past what a `u16` holds. The comptime block
+/// below is what makes that a compile error rather than a four-insert bug.
+pub const capacity_max: u32 = std.math.maxInt(u16);
+
+comptime {
+    // Every offset and cursor this type stores is a `u16`, and the largest of
+    // them is the arena's one-past-the-end. This is the relation the constant
+    // above exists to satisfy.
+    assert(capacity_max <= std.math.maxInt(u16));
+    // An entry costs at least the overhead, which is what makes
+    // `entriesRequired` exact rather than an estimate.
+    assert(Field.overhead > 0);
+    assert(capacity_max >= Field.overhead);
+}
 
 /// One entry's bookkeeping. The value is stored immediately after the name, so
 /// two lengths and one offset locate both. Six octets, which matters: at 4 KiB
@@ -64,7 +97,13 @@ pub const Entry = struct {
     name_len: u16,
     value_len: u16,
 
-    fn size(entry: Entry) u32 {
+    /// The entry's charge against the table's budget: its octets plus the
+    /// fixed overhead. Named apart from `Field.size` deliberately — that one
+    /// returns `u64` because it is summed over a whole header list, this one
+    /// `u32` because it is bounded by `capacity_max`, and a reader holding
+    /// both at once should not have to work out which is which.
+    fn accountedSize(entry: Entry) u32 {
+        assert(@as(u32, entry.name_len) + @as(u32, entry.value_len) <= capacity_max);
         return @as(u32, entry.name_len) + @as(u32, entry.value_len) + @as(u32, Field.overhead);
     }
 };
@@ -75,7 +114,7 @@ pub const Entry = struct {
 /// estimate, and it is why the ring can be sized once and never checked again.
 pub fn entriesRequired(capacity: u32) u32 {
     assert(capacity <= capacity_max);
-    return capacity / @as(u32, Field.overhead);
+    return @divFloor(capacity, @as(u32, Field.overhead));
 }
 
 /// Storage for a table of `capacity` octets, for callers that know the size at
@@ -101,7 +140,8 @@ capacity: u32,
 /// Accounted size of the live entries, which is their octets plus overhead —
 /// not the arena bytes they occupy.
 size: u32 = 0,
-/// Ring position of the newest entry. Meaningless when `count` is zero.
+/// Ring position of the newest entry. Normalized to zero when `count` is
+/// zero, so an empty table has one representation rather than a stale one.
 newest: u32 = 0,
 count: u32 = 0,
 /// The live span of the arena. `begin` is the oldest entry's first octet,
@@ -137,10 +177,13 @@ pub const CapacityError = error{
 /// Apply a dynamic table size update (RFC 7541 section 6.3), evicting whatever
 /// no longer fits.
 pub fn setCapacity(table: *DynamicTable, capacity: u32) CapacityError!void {
+    assert(table.size <= table.capacity);
     if (capacity > table.capacityMax()) return error.CapacityTooLarge;
     table.capacity = capacity;
     table.evictTo(capacity);
     assert(table.size <= table.capacity);
+    assert(table.begin <= table.end);
+    if (table.count == 0) assert(table.begin == table.end);
 }
 
 /// The entry `position` places back from the newest, or null past the end.
@@ -154,9 +197,14 @@ pub fn setCapacity(table: *DynamicTable, capacity: u32) CapacityError!void {
 pub fn get(table: *const DynamicTable, position: u32) ?Field {
     if (position >= table.count) return null;
     const entry = table.entries[table.slot(position)];
-    const name_begin = entry.name_offset;
-    const value_begin = name_begin + entry.name_len;
-    const value_end = value_begin + entry.value_len;
+    // Widened on purpose. The sums are bounded by the arena, but computing
+    // them in `u16` makes that bound the *type's* job, and at `capacity_max`
+    // the last entry's end is exactly where a `u16` runs out.
+    const name_begin: u32 = entry.name_offset;
+    const value_begin: u32 = name_begin + entry.name_len;
+    const value_end: u32 = value_begin + entry.value_len;
+    assert(name_begin <= value_begin);
+    assert(value_begin <= value_end);
     assert(value_end <= table.arena.len);
     return .{
         .name = table.arena[name_begin..value_begin],
@@ -201,11 +249,14 @@ pub fn insert(table: *DynamicTable, field: Field) void {
     assert(table.end + bytes <= table.arena.len);
 
     const offset = table.end;
+    // `end` is one past the live span, so it reaches `arena.len` — which is
+    // why `capacity_max` stops one short of 65536 rather than at it.
+    assert(offset <= capacity_max);
     @memcpy(table.arena[offset..][0..name_len], field.name);
     @memcpy(table.arena[offset + name_len ..][0..value_len], field.value);
     table.end += bytes;
 
-    table.newest = if (table.count == 0) 0 else prev(table.newest, table.entries.len);
+    table.newest = if (table.count == 0) 0 else previous(table.newest, @intCast(table.entries.len));
     table.entries[table.newest] = .{
         .name_offset = @intCast(offset),
         .name_len = name_len,
@@ -220,28 +271,34 @@ pub fn insert(table: *DynamicTable, field: Field) void {
 pub fn clear(table: *DynamicTable) void {
     table.size = 0;
     table.count = 0;
+    // Normalized rather than left stale: `evictTo` asserts the empty table has
+    // its cursors at zero, and `newest` is documented as normalized rather than
+    // meaningless so that a reader is not left deriving which it is.
     table.newest = 0;
     table.begin = 0;
     table.end = 0;
+    assert(table.size == 0);
+    assert(table.begin == table.end);
 }
 
 /// Evict oldest-first until the accounted size is at most `limit`.
 fn evictTo(table: *DynamicTable, limit: u32) void {
-    var evicted: u32 = 0;
-    while (table.size > limit) {
-        // Bounded by the live entries: each pass drops exactly one, and the
-        // size reaches zero with the last of them.
-        assert(evicted < table.entries.len + 1);
-        evicted += 1;
-        assert(table.count > 0);
-
+    // `count` is in the condition rather than only in an assertion. Every pass
+    // drops one entry and every entry charges at least `Field.overhead`, so the
+    // size argument alone does terminate — but assertions are a build option
+    // here (docs/TIGER_STYLE.md), and with them off a `size`/`count`
+    // disagreement would underflow `count - 1` to `maxInt(u32)` and spin. The
+    // bound belongs where it cannot be compiled out.
+    while (table.count > 0 and table.size > limit) {
         const oldest = table.entries[table.slot(table.count - 1)];
         // FIFO means the oldest entry is always at the front of the live span.
         assert(oldest.name_offset == table.begin);
         table.begin += @as(u32, oldest.name_len) + @as(u32, oldest.value_len);
-        table.size -= oldest.size();
+        table.size -= oldest.accountedSize();
         table.count -= 1;
     }
+    // Either the limit is met, or there is nothing left to drop.
+    assert(table.size <= limit or table.count == 0);
     if (table.count == 0) {
         // Nothing live, so start the arena over rather than leaving the cursors
         // stranded at the far end.
@@ -274,26 +331,27 @@ fn compact(table: *DynamicTable) void {
 fn slot(table: *const DynamicTable, position: u32) u32 {
     assert(position < table.count);
     assert(table.entries.len > 0);
-    const length: u32 = @intCast(table.entries.len);
-    return (table.newest + position) % length;
+    const entries_count: u32 = @intCast(table.entries.len);
+    assert(table.newest < entries_count);
+    return (table.newest + position) % entries_count;
 }
 
-/// True when `bytes` points inside the arena, which is the aliasing `insert`
-/// refuses.
+/// True when `bytes` shares any octet with the arena, which is the aliasing
+/// `insert` refuses.
+///
+/// Overlap rather than containment: testing only the start pointer would miss a
+/// slice that begins before the arena and reaches into it, and this assertion
+/// is the whole defence for a lifetime rule whose failure is silent.
 fn aliasesArena(table: *const DynamicTable, bytes: []const u8) bool {
-    if (bytes.len == 0) return false;
-    if (table.arena.len == 0) return false;
-    const arena_begin = @intFromPtr(table.arena.ptr);
-    const arena_end = arena_begin + table.arena.len;
-    const begin = @intFromPtr(bytes.ptr);
-    assert(arena_begin < arena_end);
-    return begin >= arena_begin and begin < arena_end;
+    return memory.overlaps(bytes, table.arena);
 }
 
-fn prev(index: u32, length: usize) u32 {
-    assert(length > 0);
-    const count: u32 = @intCast(length);
-    return (index + count - 1) % count;
+/// The ring slot before `index`, wrapping. `entries_count` is a count of slots
+/// rather than a byte length, and the caller has it as a `u32` already.
+fn previous(index: u32, entries_count: u32) u32 {
+    assert(entries_count > 0);
+    assert(index < entries_count);
+    return (index + entries_count - 1) % entries_count;
 }
 
 const testing = std.testing;
@@ -422,6 +480,57 @@ test "a size update evicts down to the new capacity" {
     // Raising it again is legal up to the arena, and no further.
     try table.setCapacity(4096);
     try testing.expectError(error.CapacityTooLarge, table.setCapacity(4097));
+}
+
+test "an arena at capacity_max does not overflow its own offsets" {
+    // The shape that broke the u16 entry fields when capacity_max was 65536:
+    // four entries of 16 KiB leave the fourth at offset 49152 with 16384
+    // octets, and `get` then computes 49152 + 16384 = 65536 — one past what a
+    // u16 holds. It read as a bounds check passing, because the wrapped end
+    // was zero and zero is less than the arena length.
+    var storage: Storage(capacity_max) = .{};
+    var table = storage.table();
+
+    const quarter = capacity_max / 4;
+    var round: u32 = 0;
+    while (round < 12) : (round += 1) {
+        var value: [quarter]u8 = undefined;
+        @memset(&value, @intCast('a' + round % 26));
+        table.insert(.{ .name = "n", .value = value[0 .. quarter - 1] });
+
+        var position: u32 = 0;
+        while (position < table.count) : (position += 1) {
+            const field = table.get(position).?;
+            try testing.expect(field.name.len + field.value.len <= capacity_max);
+        }
+        try testing.expect(table.end <= capacity_max);
+    }
+}
+
+test "the write cursor reaches the end of the arena without overflowing an offset" {
+    // A single large entry can never do this: its 32 octets of overhead mean
+    // its data is at most `capacity - 32`. One-octet entries walk `end` one
+    // step at a time, so it lands on every value including `arena.len` itself
+    // — the offset a u16 could not hold while capacity_max was 65536.
+    var storage: Storage(capacity_max) = .{};
+    var table = storage.table();
+
+    var reached_end = false;
+    var round: u32 = 0;
+    while (round < capacity_max + 64) : (round += 1) {
+        table.insert(.{ .name = "n", .value = "" });
+        if (table.end == capacity_max) reached_end = true;
+        try testing.expect(table.end <= capacity_max);
+        try testing.expect(table.size <= table.capacity);
+        try testing.expect(table.begin <= table.end);
+    }
+    try testing.expect(reached_end);
+
+    // And an entry with no octets at all, which is what can then take an
+    // offset to exactly `arena.len` rather than one below it.
+    table.insert(.{ .name = "", .value = "" });
+    try testing.expect(table.end <= capacity_max);
+    try testing.expectEqualStrings("", table.get(0).?.name);
 }
 
 test "the arena compacts instead of growing, over many rotations" {
