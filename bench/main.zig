@@ -27,6 +27,7 @@ const h2 = @import("h2");
 
 const assert = std.debug.assert;
 
+const fields = h2.fields;
 const hpack = h2.hpack;
 const examples = hpack.rfc7541_examples;
 
@@ -57,6 +58,10 @@ const workloads = [_]Workload{
     .{ .name = "huffman decode long", .run = benchHuffmanDecodeLong },
     .{ .name = "huffman decode long ref", .run = benchHuffmanDecodeLongReference },
     .{ .name = "huffman encode", .run = benchHuffmanEncode },
+    .{ .name = "field block validate", .run = benchFieldBlockValidate },
+    .{ .name = "field block validate ref", .run = benchFieldBlockValidateReference },
+    .{ .name = "field value long", .run = benchFieldValueLong },
+    .{ .name = "field value long ref", .run = benchFieldValueLongReference },
 };
 
 const Workload = struct {
@@ -415,6 +420,149 @@ fn benchDecodeKernel(iterations: u64, wire: []const u8, kernel: Kernel) u64 {
         std.mem.doNotOptimizeAway(checksum);
     }
     return checksum;
+}
+
+/// A request's worth of fields, as a consumer validates them: every name and
+/// every value in one header block, under the reading a proxy hardening an
+/// HTTP/1.1 downgrade would pick.
+///
+/// The workload is a field *block* rather than one string because that is the
+/// unit a consumer pays for. Real names are short — `:method` is seven octets,
+/// and eleven of the fourteen below are under sixteen — so most of them never
+/// fill a single vector and the per-call cost is the number. That is the
+/// honest measurement, and it is the reason the long-value workload below
+/// exists beside it rather than instead of it.
+fn benchFieldBlockValidate(iterations: u64) u64 {
+    return benchFieldValidate(iterations, .kernel);
+}
+
+fn benchFieldBlockValidateReference(iterations: u64) u64 {
+    return benchFieldValidate(iterations, .reference);
+}
+
+/// The same two, on one 132-octet cookie: where a sweep has full vectors to
+/// work with and the difference against a byte-at-a-time loop is the point.
+fn benchFieldValueLong(iterations: u64) u64 {
+    return benchFieldValue(iterations, long_text, .kernel);
+}
+
+fn benchFieldValueLongReference(iterations: u64) u64 {
+    return benchFieldValue(iterations, long_text, .reference);
+}
+
+/// A plausible request, with the header names spelled as HTTP/2 requires them.
+const request_fields = [_]hpack.Field{
+    .{ .name = ":method", .value = "GET" },
+    .{ .name = ":scheme", .value = "https" },
+    .{ .name = ":authority", .value = "www.example.com" },
+    .{ .name = ":path", .value = "/some/reasonably/long/path?q=1&lang=en" },
+    .{ .name = "user-agent", .value = "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/121.0" },
+    .{ .name = "accept", .value = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" },
+    .{ .name = "accept-language", .value = "en-US,en;q=0.5" },
+    .{ .name = "accept-encoding", .value = "gzip, deflate, br" },
+    .{ .name = "referer", .value = "https://www.example.com/index.html" },
+    .{ .name = "cookie", .value = long_text },
+    .{ .name = "upgrade-insecure-requests", .value = "1" },
+    .{ .name = "sec-fetch-dest", .value = "document" },
+    .{ .name = "cache-control", .value = "max-age=0" },
+    .{ .name = "content-length", .value = "0" },
+};
+
+/// Which of the two statements of the rules to time. `.reference` is the
+/// transcription from the RFC text that `syntax.zig` proves the kernel against,
+/// and it is a byte-at-a-time loop — the same arrangement `huffman decode` and
+/// `huffman decode ref` have, and reported the same way, because a vector
+/// kernel with no scalar number beside it is a claim rather than a measurement.
+const Validator = enum { kernel, reference };
+
+/// Octets of text in `request_fields`, so the runtime copy below is sized from
+/// the data rather than from a number that would go stale when a field is
+/// added.
+const request_text_octets = blk: {
+    var total: usize = 0;
+    for (request_fields) |field| total += field.name.len + field.value.len;
+    break :blk total;
+};
+
+/// The block, copied into storage the optimizer must treat as escaped.
+///
+/// This is not ceremony. With the string literals reaching the validator
+/// directly, every call has a compile-time-known input and a `void` result, and
+/// ReleaseFast folds the entire loop: the first version of these four workloads
+/// reported 0.265 ns/op for fourteen fields, which is the harness's own
+/// documented footgun landing a second time. Escaping the storage is what makes
+/// the calls happen, and folding each outcome into the checksum is what keeps
+/// them happening.
+const Block = struct {
+    storage: [request_text_octets]u8,
+    names: [request_fields.len][]const u8,
+    values: [request_fields.len][]const u8,
+
+    fn init(block: *Block) void {
+        var cursor: usize = 0;
+        for (request_fields, 0..) |field, index| {
+            @memcpy(block.storage[cursor..][0..field.name.len], field.name);
+            block.names[index] = block.storage[cursor..][0..field.name.len];
+            cursor += field.name.len;
+
+            @memcpy(block.storage[cursor..][0..field.value.len], field.value);
+            block.values[index] = block.storage[cursor..][0..field.value.len];
+            cursor += field.value.len;
+        }
+        assert(cursor == request_text_octets);
+        std.mem.doNotOptimizeAway(&block.storage);
+    }
+};
+
+fn benchFieldValidate(iterations: u64, validator: Validator) u64 {
+    assert(iterations >= 1);
+    var block: Block = undefined;
+    block.init();
+
+    var checksum: u64 = 0;
+    var index: u64 = 0;
+    while (index < iterations) : (index += 1) {
+        for (block.names, block.values) |name, value| {
+            checksum +%= switch (validator) {
+                .kernel => outcome(fields.validateName(name, .strict)) +%
+                    outcome(fields.validateValue(value, .strict)),
+                .reference => outcome(fields.syntax.validateNameReference(name, .strict)) +%
+                    outcome(fields.syntax.validateValueReference(value, .strict)),
+            };
+        }
+        std.mem.doNotOptimizeAway(checksum);
+    }
+    return checksum;
+}
+
+fn benchFieldValue(iterations: u64, comptime text: []const u8, validator: Validator) u64 {
+    assert(iterations >= 1);
+    comptime assert(text.len >= 1);
+    // Sized from `text` rather than from `long_text`: the storage and the
+    // source have to be the same length for the `@memcpy`, and writing the
+    // bound as a different constant made that a precondition no assert stated.
+    var storage: [text.len]u8 = undefined;
+    @memcpy(&storage, text);
+    std.mem.doNotOptimizeAway(&storage);
+    const value: []const u8 = &storage;
+
+    var checksum: u64 = 0;
+    var index: u64 = 0;
+    while (index < iterations) : (index += 1) {
+        checksum +%= switch (validator) {
+            .kernel => outcome(fields.validateValue(value, .strict)),
+            .reference => outcome(fields.syntax.validateValueReference(value, .strict)),
+        };
+        std.mem.doNotOptimizeAway(checksum);
+    }
+    return checksum;
+}
+
+/// A validation result as a number, so that discarding it is not an option the
+/// optimizer has. Accept and reject differ so that a kernel that started
+/// rejecting everything would not keep the same number.
+fn outcome(result: anytype) u64 {
+    if (result) |_| return 1 else |_| return 2;
 }
 
 fn benchHuffmanEncode(iterations: u64) u64 {

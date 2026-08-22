@@ -543,3 +543,81 @@ fn fuzzInteger(_: void, smith: *std.testing.Smith) !void {
     std.debug.assert(again.value == decoded.value);
     std.debug.assert(again.octets == written);
 }
+
+/// Octets that classify differently across the four rules, so planting one is
+/// always informative: the two colons and slashes part `.strict` from
+/// `.minimal`, the controls part a value's `Delimiter` from its `Character`,
+/// and `0x80` is the obs-text that must *not* be rejected.
+const interesting_octets = "\x00\t\n\r A Z:/\"\x01\x7f\x80\xff!~";
+
+test "fuzz: field syntax kernels agree" {
+    try std.testing.fuzz({}, fuzzFieldSyntax, .{});
+}
+
+/// The vector sweep and the transcribed reference must be indistinguishable.
+///
+/// `syntax.zig` already proves at compile time that the two agree on every one
+/// of the 256 octets, so what is left for a fuzzer is the *slice* walk: the
+/// tail, the lengths that straddle a vector boundary, and which of several
+/// rejected octets is the one reported. That last one is observable because a
+/// name carrying both a misplaced colon and an uppercase letter returns a
+/// different error depending on which comes first, so a sweep that found *some*
+/// rejected octet rather than the first is caught here.
+///
+/// The input is built rather than drawn flat, and the difference matters. Drawn
+/// octets reject within the first few almost always, which leaves the tail loop
+/// and every long accepting run unreached — so the base is an octet all four
+/// rules accept, and faults are then planted at drawn positions on top of it.
+fn fuzzFieldSyntax(_: void, smith: *std.testing.Smith) !void {
+    var text: [input_max]u8 = undefined;
+    const length = smith.index(text.len + 1);
+    std.debug.assert(length <= text.len);
+    // The base octet has to be one all four rule sets accept, or the planted
+    // faults would never be the first rejection and every case would collapse
+    // to the same answer.
+    @memset(text[0..length], 'a');
+
+    if (length > 0) {
+        var planted: usize = 0;
+        const faults = smith.index(faults_max + 1);
+        while (planted < faults) : (planted += 1) {
+            const position = smith.index(length);
+            std.debug.assert(position < length);
+            text[position] = interesting_octets[smith.index(interesting_octets.len)];
+        }
+    }
+
+    const subject = text[0..length];
+    for ([_]h2.fields.Rules{ .minimal, .strict }) |rules| {
+        try expectSameOutcome(
+            h2.fields.NameError,
+            h2.fields.syntax.validateNameReference(subject, rules),
+            h2.fields.validateName(subject, rules),
+        );
+        try expectSameOutcome(
+            h2.fields.ValueError,
+            h2.fields.syntax.validateValueReference(subject, rules),
+            h2.fields.validateValue(subject, rules),
+        );
+    }
+}
+
+/// Faults planted in one drawn run. Three is enough for the orderings that
+/// decide which error comes back, and small enough that a failing case is
+/// readable.
+const faults_max = 3;
+
+comptime {
+    // A fault has to have somewhere to go: the generator plants at a drawn
+    // index into a run of at most `input_max` octets.
+    std.debug.assert(faults_max <= input_max);
+}
+
+/// Two results of the same error set are the same result: both accepted, or
+/// both rejected with the same error. Written out because the payload is
+/// `void`, so `expectEqual` on the unions themselves compares nothing.
+fn expectSameOutcome(comptime Set: type, reference: Set!void, kernel: Set!void) !void {
+    const expected: ?Set = if (reference) |_| null else |err| err;
+    const actual: ?Set = if (kernel) |_| null else |err| err;
+    try std.testing.expectEqual(expected, actual);
+}
