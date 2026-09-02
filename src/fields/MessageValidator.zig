@@ -28,13 +28,27 @@
 //! section 8.2.2's connection-specific fields, which is where a
 //! `transfer-encoding` smuggled through an HTTP/1.1 downgrade would be caught.
 //!
+//! Also checked, and not an HTTP/2 rule: `content-length`'s own syntax, which
+//! is RFC 9110 section 8.6's `1*DIGIT`, plus two field lines that disagree.
+//! That pair is the response-splitting primitive, and it is decidable here.
+//!
 //! Not checked, because none of it is decidable from a field block alone:
-//! whether `:authority` and a `Host` header identify the same entity (section
-//! 8.3.1 wants both normalized as URIs), whether `:authority` carries the
-//! deprecated userinfo subcomponent, whether a `content-length` matches the
-//! DATA frames that follow it (section 8.1.1), and whether a method or status
-//! is one that exists. The first two want a URI parser and the last two want
-//! connection state; both belong to a consumer.
+//! whether `:authority` and a `Host` header identify the same entity, whether
+//! `:authority` carries the deprecated userinfo subcomponent, whether a
+//! `content-length` matches the DATA frames that follow it (section 8.1.1),
+//! and whether a method or status is one that exists. The last two want
+//! connection state and belong to a consumer.
+//!
+//! The `Host` one deserves its reason spelled out, because h3 *does* check it
+//! and the difference is the RFC's rather than a gap here. RFC 9114 section
+//! 4.3.1 requires an HTTP/3 request to carry `:authority` or `Host`, and says
+//! that if both are present "they MUST contain the same value" — a literal
+//! comparison, decidable from the section. RFC 9113 section 8.3.1 has no such
+//! presence requirement, and its comparison is a SHOULD phrased as
+//! "identifies an entity that differs", followed by "the values of fields need
+//! to be normalized to compare them" and a MUST to apply scheme-based
+//! normalization. That needs a URI parser, so it stays with the consumer. The
+//! two packages differ here because HTTP/2 and HTTP/3 differ here.
 //!
 //! ## Malformed is always the same answer
 //!
@@ -171,6 +185,15 @@ const connection_specific = std.StaticStringMap(void).initComptime(.{
 const te_field_name = "te";
 const te_permitted_value = "trailers";
 
+const content_length_field_name = "content-length";
+
+/// `u64` holds 20 decimal digits, so a longer run cannot be represented and is
+/// refused rather than truncated. RFC 9110 section 8.6 asks a recipient to
+/// "prevent parsing errors due to integer conversion overflows"; it also says
+/// any value at or above zero is valid, so this bound is a deliberate and
+/// documented departure at a size no real message reaches.
+const content_length_digits_max = 20;
+
 /// RFC 9113 section 8.5's method, compared exactly: RFC 9110 section 9.1 says
 /// "the method token is case-sensitive", so `connect` is a different method
 /// and not a sloppy spelling of this one.
@@ -211,6 +234,11 @@ pub const Error = syntax.NameError || syntax.ValueError || error{
     ConnectionSpecific,
     /// A `te` field with a value other than `trailers` (section 8.2.2).
     UnsupportedTe,
+    /// RFC 9110 section 8.6: a `content-length` that is not `1*DIGIT`, or two
+    /// field lines that disagree. Section 8.1.1's own rule — that the value
+    /// equals the sum of the DATA payload lengths — is not decidable here and
+    /// stays with the consumer; `contentLength` hands it the number.
+    ContentLengthInvalid,
     /// An empty value on a pseudo-header field that must carry one. Section
     /// 8.3.1 asks for "exactly one *valid* value", and section 8.5 for an
     /// `:authority` naming a host and port; `:path` is exempt because whether
@@ -248,6 +276,10 @@ path_is_empty: bool,
 /// Whether `finish` has run, so that using a validator past its end is a
 /// programming error rather than a wrong answer.
 finished: bool,
+/// RFC 9110 section 8.6's value, kept as a number rather than a slice so that
+/// nothing here retains a caller's octets — see the lifetime note above.
+content_length: u64,
+content_length_seen: bool,
 
 comptime {
     // The lifetime rule at the top of this file, enforced rather than promised.
@@ -273,6 +305,8 @@ pub fn init(options: Options) MessageValidator {
         .scheme_is_http = false,
         .path_is_empty = false,
         .finished = false,
+        .content_length = 0,
+        .content_length_seen = false,
     };
     // The type's whole correctness rests on starting with nothing seen: `seen`
     // is both the duplicate check and the presence check, so a validator that
@@ -383,11 +417,54 @@ fn regularField(validator: *MessageValidator, offered: *const Field) Error!void 
         if (!std.ascii.eqlIgnoreCase(offered.value, te_permitted_value)) return error.UnsupportedTe;
     }
 
+    if (std.mem.eql(u8, offered.name, content_length_field_name)) {
+        try validator.checkContentLength(offered.value);
+    }
+
     // Set last, so that a field this function refused cannot make a later
     // pseudo-header look out of order. A caller is meant to stop at the first
     // error either way — see `field` — but a rule that only holds when the
     // caller behaves is a rule with a hole in it.
     validator.regular_seen = true;
+}
+
+/// RFC 9110 section 8.6: `Content-Length = 1*DIGIT`. A second field line with a
+/// different value is the response-splitting pair, and section 8.6 permits
+/// refusing even the repeated-identical form — which this does, because "a
+/// sender MUST NOT forward a message with a Content-Length header field value
+/// that does not match the ABNF above".
+///
+/// Section 8.1.1's rule, that the value equals the sum of the DATA frame
+/// payload lengths, needs frames this file never sees. `contentLength` exposes
+/// the parsed number so a consumer can finish that check.
+fn checkContentLength(validator: *MessageValidator, value: []const u8) Error!void {
+    const length = parseContentLength(value) orelse return error.ContentLengthInvalid;
+    if (validator.content_length_seen and validator.content_length != length) {
+        return error.ContentLengthInvalid;
+    }
+    validator.content_length_seen = true;
+    validator.content_length = length;
+}
+
+/// RFC 9110 section 8.6's `1*DIGIT`, with the overflow that section asks a
+/// recipient to prevent. Null is "not a content-length", never a silent zero.
+fn parseContentLength(value: []const u8) ?u64 {
+    if (value.len == 0) return null;
+    if (value.len > content_length_digits_max) return null;
+    var total: u64 = 0;
+    for (value) |octet| {
+        if (octet < '0' or octet > '9') return null;
+        total = std.math.mul(u64, total, 10) catch return null;
+        total = std.math.add(u64, total, octet - '0') catch return null;
+    }
+    return total;
+}
+
+/// The `content-length` a well-formed section carried, for a consumer that has
+/// to compare it against the DATA frames it goes on to read (section 8.1.1).
+pub fn contentLength(validator: *const MessageValidator) ?u64 {
+    if (!validator.content_length_seen) return null;
+    return validator.content_length;
 }
 
 /// Whether a scheme is one section 8.3.1's non-empty-`:path` rule speaks about.
@@ -883,4 +960,43 @@ test "both readings of section 8.2.1 are available to a message" {
     const block = minimal_request ++ [_]Field{.{ .name = "x/y", .value = "z" }};
     try check(lax, &block);
     try testing.expectError(error.Character, check(request, &block));
+}
+
+test "RFC 9110 section 8.6: content-length is 1*DIGIT and agrees with itself" {
+    // Two lengths that disagree is the response-splitting pair: whichever the
+    // next hop believes, the other half of the stream is a message it did not
+    // see coming. This is RFC 9110's rule rather than RFC 9113's, which is why
+    // it belongs in both this package and h3 — section 8.1.1's own rule, that
+    // the value matches the DATA frames, needs frames this file never sees.
+    try testing.expectError(error.ContentLengthInvalid, check(response, &[_]Field{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-length", .value = "10" },
+        .{ .name = "content-length", .value = "20" },
+    }));
+    try check(response, &[_]Field{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-length", .value = "10" },
+        .{ .name = "content-length", .value = "10" },
+    });
+    for ([_][]const u8{ "", "-1", "+1", "0x10", "1 0", "12a", "10, 10", "99999999999999999999" }) |bad| {
+        try testing.expectError(error.ContentLengthInvalid, check(response, &[_]Field{
+            .{ .name = ":status", .value = "200" },
+            .{ .name = "content-length", .value = bad },
+        }));
+    }
+    // Leading zeros match `1*DIGIT` and mean what they say.
+    try check(response, &[_]Field{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-length", .value = "007" },
+        .{ .name = "content-length", .value = "7" },
+    });
+}
+
+test "the content-length is handed to the consumer that can finish the check" {
+    var validator: MessageValidator = .init(response);
+    try validator.field(&.{ .name = ":status", .value = "204" });
+    try testing.expectEqual(@as(?u64, null), validator.contentLength());
+    try validator.field(&.{ .name = "content-length", .value = "4096" });
+    try validator.finish();
+    try testing.expectEqual(@as(?u64, 4096), validator.contentLength());
 }
