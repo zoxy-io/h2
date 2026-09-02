@@ -15,7 +15,19 @@ pub const assertions = @import("assert.zig");
 
 pub const fields = @import("fields.zig");
 pub const frame = @import("frame.zig");
-pub const hpack = @import("hpack.zig");
+
+/// HPACK (RFC 7541), which lives in zoxy-io/hpack and is re-exported here.
+///
+/// Re-exported rather than merely depended on, for two reasons. HPACK is part
+/// of what "speaking HTTP/2" means, so this package's scope did not change when
+/// the code moved; and `h2.hpack.Decoder` is the spelling zoxy and zrk already
+/// write, so churning them to say `hpack.Decoder` would buy nothing.
+///
+/// It is a separate package because RFC 9204 adopts two of its pieces unchanged
+/// — the prefixed integer and the Huffman code — and zoxy-io/h3 builds against
+/// exactly those. The alternative was a second copy of a 900-line vectorised
+/// Huffman decoder in the same organisation.
+pub const hpack = @import("hpack");
 
 test {
     _ = assertions;

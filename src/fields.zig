@@ -29,7 +29,10 @@
 
 const std = @import("std");
 
-const Field = @import("hpack/Field.zig");
+// The field type is HPACK's, and HPACK is zoxy-io/hpack now. The validators
+// take one rather than a name/value pair because a caller already holds one:
+// it is what the decoder hands back.
+const Field = @import("hpack").Field;
 
 pub const MessageValidator = @import("fields/MessageValidator.zig");
 pub const syntax = @import("fields/syntax.zig");

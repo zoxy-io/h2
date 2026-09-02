@@ -18,6 +18,17 @@ pub fn build(b: *std.Build) void {
     const h2_options = b.addOptions();
     h2_options.addOption(bool, "assertions", assertions);
 
+    // HPACK, which lives in zoxy-io/hpack. The assertions option is
+    // **forwarded**, not defaulted: hpack sits two levels below a binary, so a
+    // consumer that turned assertions off would otherwise still be running
+    // hpack's, with no way to tell. This line is load-bearing.
+    const hpack_dependency = b.dependency("hpack", .{
+        .target = target,
+        .optimize = optimize,
+        .assertions = assertions,
+    });
+    const hpack_module = hpack_dependency.module("hpack");
+
     // The public module: consumers `@import("h2")` this.
     const h2_module = b.addModule("h2", .{
         .root_source_file = b.path("src/root.zig"),
@@ -25,6 +36,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "build_options", .module = h2_options.createModule() },
+            .{ .name = "hpack", .module = hpack_module },
         },
     });
 
@@ -123,7 +135,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const corpus_run = b.addRunArtifact(corpus_tests);
-    const corpus_step = b.step("corpus", "Vendored corpora: HPACK interop and HTTP/2 frame fixtures");
+    const corpus_step = b.step("corpus", "Vendored corpus: HTTP/2 frame fixtures");
     corpus_step.dependOn(&corpus_run.step);
 
     // The README's usage example, compiled and run. A usage example that is
@@ -173,7 +185,7 @@ pub fn build(b: *std.Build) void {
     // The format gate. A build step rather than a documented `zig fmt --check`
     // incantation, so that the list of formatted paths lives in exactly one
     // place and CI cannot check a different set than a developer does.
-    const fmt_paths = &.{ "src", "scripts", "bench", "fuzz", "example", "checks", "corpus/all.zig", "corpus/hpack.zig", "corpus/frames.zig", "build.zig", "build.zig.zon" };
+    const fmt_paths = &.{ "src", "scripts", "bench", "fuzz", "example", "checks", "corpus/all.zig", "corpus/frames.zig", "build.zig", "build.zig.zon" };
     const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
     const fmt_step = b.step("fmt", "Check formatting (zig build fmt-fix rewrites)");
     fmt_step.dependOn(&fmt_check.step);

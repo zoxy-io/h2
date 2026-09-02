@@ -12,6 +12,12 @@ HTTP/2 frame codec, HPACK, and field validation.
 
 * **RFC 9113 frame codec** — framing only, not the connection state machine.
 * **RFC 7541 HPACK** — encoder, decoder, Huffman, static and dynamic tables.
+  These live in [zoxy-io/hpack](https://github.com/zoxy-io/hpack) and are
+  re-exported here as `h2.hpack`, unchanged. They moved because RFC 9204 adopts
+  two of them verbatim — the prefixed integer and the Huffman code — so
+  [zoxy-io/h3](https://github.com/zoxy-io/h3) builds against exactly those, and
+  the alternative was a second copy of a 900-line vectorised Huffman decoder in
+  the same organisation.
 * **RFC 9113 §8.2 and §8.3 message validation** — the octet rules for field
   names and values, and the pseudo-header rules that make a request or response
   well-formed. Between them they are the guard against request smuggling
@@ -28,7 +34,10 @@ stay in the consumer.
 * Never allocates — no `std.mem.Allocator` in the public API.
 * Never copies where a slice will do.
 * Caller-owned, caller-sized buffers, including HPACK's dynamic table.
-* Zero dependencies beyond the Zig toolchain.
+* One dependency, [hpack](https://github.com/zoxy-io/hpack), which has none of
+  its own. The rule is **no dependency outside the organisation, and none that
+  pulls in a runtime or a libcrypto**; `zig build lint` still forbids
+  `@cImport`.
 * Assertions ship by default, in every optimize mode. Roughly 350 of them, and
   several are the only check on an arithmetic relation. `-Dassertions=false`
   removes them for a consumer that has made that argument — see
@@ -95,7 +104,7 @@ zig build ci -Doptimize=ReleaseFast                     # zoxy's build
 zig build ci -Doptimize=ReleaseFast -Dassertions=false  # zrk's build
 zig build bench   # decode/encode microbenchmarks (ReleaseFast)
 zig build fuzz    # replay the fuzz corpus; --fuzz to actually fuzz
-zig build corpus  # interoperability conformance against other implementations
+zig build corpus  # vendored HTTP/2 frame fixtures
 zig build fmt-fix # reformat in place
 zig build example # build and run the usage example above
 ```

@@ -51,14 +51,21 @@ is not represented by any test that runs on a laptop.
 
 ## Policies
 
-- **No dependencies.** `build.zig.zon` has an empty `dependencies` table and
-  keeps it. `@cImport` is lint-forbidden. The one place C is admissible is
-  `bench/`, for a comparison against an established implementation, which is
-  outside `src/` and outside the lint's walk — the same arrangement hparse uses
-  for picohttpparser.
+- **One dependency, and the rule that replaced "none".**
+  [hpack](https://github.com/zoxy-io/hpack) holds RFC 7541 and is re-exported
+  here as `h2.hpack`; it has no dependencies of its own, so the graph is one
+  deep. The policy is now **no dependency outside the organisation, and none
+  that pulls in a runtime or a libcrypto**. `@cImport` is still lint-forbidden.
+  The one place C is admissible is `bench/`, for a comparison against an
+  established implementation, which is outside `src/` and outside the lint's
+  walk — the same arrangement hparse uses for picohttpparser.
+- **`-Dassertions` is forwarded to hpack, not defaulted.** hpack sits two levels
+  below a binary, so a consumer that turned assertions off would otherwise still
+  be running hpack's. The line is in build.zig and a review should check it.
 - **An assertion may not be the only guard on a `catch unreachable`.** This is
   the rule the option makes load-bearing, and it has already been violated once:
-  `Encoder.encodeSizeUpdate` guarded `setCapacity`'s `catch unreachable` with
+  `Encoder.encodeSizeUpdate` (now in hpack) guarded `setCapacity`'s
+  `catch unreachable` with
   `assert(capacity <= capacityMax())`, and with `-Dassertions=false` in
   ReleaseFast that became an unkillable spin on a value a consumer takes from
   the peer's `SETTINGS_HEADER_TABLE_SIZE`. If an `unreachable` is reachable when

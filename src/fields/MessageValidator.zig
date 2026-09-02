@@ -46,7 +46,7 @@
 
 const std = @import("std");
 
-const Field = @import("../hpack/Field.zig");
+const Field = @import("hpack").Field;
 const syntax = @import("syntax.zig");
 
 const MessageValidator = @This();
