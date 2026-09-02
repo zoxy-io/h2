@@ -6,18 +6,11 @@
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/zoxy-io/h2/test-x86_64-windows.yml?label=x86_64-windows)
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/zoxy-io/h2/test-macos.yml?label=macos)
 
-HTTP/2 frame codec, HPACK, and field validation.
+HTTP/2 frame codec and field validation.
 
 ## Scope
 
 * **RFC 9113 frame codec** — framing only, not the connection state machine.
-* **RFC 7541 HPACK** — encoder, decoder, Huffman, static and dynamic tables.
-  These live in [zoxy-io/hpack](https://github.com/zoxy-io/hpack) and are
-  re-exported here as `h2.hpack`, unchanged. They moved because RFC 9204 adopts
-  two of them verbatim — the prefixed integer and the Huffman code — so
-  [zoxy-io/h3](https://github.com/zoxy-io/h3) builds against exactly those, and
-  the alternative was a second copy of a 900-line vectorised Huffman decoder in
-  the same organisation.
 * **RFC 9113 §8.2 and §8.3 message validation** — the octet rules for field
   names and values, and the pseudo-header rules that make a request or response
   well-formed. Between them they are the guard against request smuggling
@@ -29,11 +22,24 @@ Out of scope, permanently: sockets, TLS, ALPN, flow control policy, stream
 scheduling, and the connection state machine. Those differ per consumer and
 stay in the consumer.
 
+**HPACK is not on that list and is not in this package**, though it is still
+reachable as `h2.hpack`. RFC 7541 lives in
+[zoxy-io/hpack](https://github.com/zoxy-io/hpack), because RFC 9204 adopts two
+of its pieces verbatim — the prefixed integer and the Huffman code — so
+[zoxy-io/h3](https://github.com/zoxy-io/h3) builds against exactly those, and
+the alternative was a second copy of a 900-line vectorised Huffman decoder in
+the same organisation. This package re-exports it unchanged, because HPACK is
+part of what speaking HTTP/2 requires and `h2.hpack.Decoder` is the spelling
+both consumers already write. A compression bug, its fuzz targets and its
+benchmark rows belong there rather than here.
+
 ## Properties
 
 * Never allocates — no `std.mem.Allocator` in the public API.
 * Never copies where a slice will do.
-* Caller-owned, caller-sized buffers, including HPACK's dynamic table.
+* Caller-owned, caller-sized buffers — including `BlockAssembler`'s, whose
+  length *is* the bound on a field block and therefore the CONTINUATION-flood
+  defence.
 * One dependency, [hpack](https://github.com/zoxy-io/hpack), which has none of
   its own. The rule is **no dependency outside the organisation, and none that
   pulls in a runtime or a libcrypto**; `zig build lint` still forbids
@@ -52,8 +58,8 @@ stay in the consumer.
 ## Usage
 
 The receive path, end to end — a frame header, its payload, a field block spread
-across CONTINUATION frames, HPACK, and the RFC 9113 §8 rules that decide whether
-the result is a message at all:
+across CONTINUATION frames, HPACK (through the re-export), and the RFC 9113 §8
+rules that decide whether the result is a message at all:
 
 ```zig
 const h2 = @import("h2");

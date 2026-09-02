@@ -1,7 +1,10 @@
 # h2
 
-HTTP/2 frame codec (RFC 9113 §4-§6) and HPACK (RFC 7541) in Zig 0.16. A
-library, not a program: it is consumed by
+HTTP/2 frame codec (RFC 9113 §4-§6) and the message rules of RFC 9113 §8, in
+Zig 0.16. **HPACK is not here** — RFC 7541 lives in
+[zoxy-io/hpack](https://github.com/zoxy-io/hpack) and is re-exported as
+`h2.hpack`, so a compression change belongs in that repository and under that
+repository's gates. A library, not a program: it is consumed by
 [zoxy](https://github.com/zoxy-io/zoxy) (reverse proxy, libxev completion
 callbacks) and [zrk](https://github.com/zoxy-io/zrk) (load generator, zio green
 threads through `std.Io`). Read before writing code:
@@ -27,7 +30,7 @@ zoxy-io/zoxy#173 and zoxy-io/zrk#21.
   a release mode reaches the undefined behaviour a `catch unreachable` guarded
   by a removed assertion becomes. CI runs all three legs.
 - `zig build bench` — the performance gate. **Not optional for a change that
-  touches a decode or encode path.** Compare bands across runs, never single
+  touches a frame or validation path.** Compare bands across runs, never single
   numbers: a 3% move between two runs on a laptop is noise, and reporting it as
   a regression trains everyone to ignore the gate. Say which numbers moved and
   by how much in the commit message when they move at all.
@@ -64,9 +67,9 @@ is not represented by any test that runs on a laptop.
   be running hpack's. The line is in build.zig and a review should check it.
 - **An assertion may not be the only guard on a `catch unreachable`.** This is
   the rule the option makes load-bearing, and it has already been violated once:
-  `Encoder.encodeSizeUpdate` (now in hpack) guarded `setCapacity`'s
-  `catch unreachable` with
-  `assert(capacity <= capacityMax())`, and with `-Dassertions=false` in
+  `Encoder.encodeSizeUpdate` (in hpack now) guarded `setCapacity`'s
+  `catch unreachable` with `assert(capacity <= capacityMax())`, and with
+  `-Dassertions=false` in
   ReleaseFast that became an unkillable spin on a value a consumer takes from
   the peer's `SETTINGS_HEADER_TABLE_SIZE`. If an `unreachable` is reachable when
   the assertions are gone, the guard is a returned error and the assertion is
@@ -81,7 +84,9 @@ is not represented by any test that runs on a laptop.
 - **No allocator, anywhere.** Not "no allocation after init" — there is no
   `init` in a library. `std.mem.Allocator` does not appear in `src/`, and
   `zig build lint` enforces it. Every buffer is caller-owned and caller-sized,
-  HPACK's dynamic table included. Tests use `std.testing.allocator`.
+  `BlockAssembler`'s field-block buffer included — its length *is* the bound on
+  a field block, and therefore the CONTINUATION-flood defence. Tests use
+  `std.testing.allocator`.
 - **No I/O types in the seam.** No `std.Io`, `std.posix`, `std.os`, `std.net`,
   `std.fs` under `src/`, lint-enforced. The temptation is specific and worth
   naming: a frame codec wants to be `readFrame(reader)`. It cannot be, because
@@ -89,10 +94,9 @@ is not represented by any test that runs on a laptop.
   excludes one of them. Bytes in, frames and header fields out; the encoder
   writes into a caller-owned `[]u8`.
 - **Every bound is a named constant** with a comptime assert relating it to its
-  neighbours. HPACK is the compression-bomb surface and CONTINUATION frames are
-  the unbounded-loop surface, so "put a limit on everything" is not a style
-  preference here — every limit traces to a SETTINGS parameter or an RFC
-  clause, and the constant says which.
+  neighbours. CONTINUATION frames are the unbounded-loop surface, so "put a
+  limit on everything" is not a style preference here — every limit traces to a
+  SETTINGS parameter or an RFC clause, and the constant says which.
 - **Every parsing change ships with its fuzz coverage.** `fuzz/` holds the
   targets; a decode path without one is not done. Note that Zig 0.16 hands the
   target a `*std.testing.Smith`, so inputs are *drawn* rather than cast out of

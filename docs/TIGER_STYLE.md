@@ -25,19 +25,20 @@ allocations, caller-owned buffers":
 caller-owned and caller-sized. This is grep-enforceable in CI, which the
 `FailingAllocator` discipline is not.
 
-The one structure that genuinely needs storage is HPACK's dynamic table, which is
-connection-lifetime, per-direction state. It stays caller-owned: the caller passes
-a fixed buffer sized by the `SETTINGS_HEADER_TABLE_SIZE` it advertises. A caller
-advertising `0` passes no buffer and the decoder's table disappears — a lever both
-consumers want, for different reasons.
+The structure that genuinely needs storage is HPACK's dynamic table, and it now
+lives in zoxy-io/hpack under the same rule: the caller passes a fixed buffer
+sized by the `SETTINGS_HEADER_TABLE_SIZE` it advertises, and a caller
+advertising `0` passes no buffer and the decoder's table disappears. What is
+left here is `BlockAssembler`'s buffer, whose length *is* the bound on a field
+block.
 
 ### Put a limit on everything
 
-Applies with more force here than anywhere in zoxy. HPACK **is** the
-compression-bomb surface, and CONTINUATION frames **are** the unbounded-loop
-surface. Every bound is a protocol bound with a name — `SETTINGS_MAX_FRAME_SIZE`,
-`SETTINGS_MAX_HEADER_LIST_SIZE`, `SETTINGS_HEADER_TABLE_SIZE` — so there is never
-an excuse for an uncounted loop.
+Applies with more force here than anywhere in zoxy. CONTINUATION frames **are**
+the unbounded-loop surface, and the compression-bomb surface is one call away in
+hpack. Every bound is a protocol bound with a name — `SETTINGS_MAX_FRAME_SIZE`,
+`SETTINGS_MAX_HEADER_LIST_SIZE` — so there is never an excuse for an uncounted
+loop.
 
 ### Explicitly-sized integers
 
@@ -49,10 +50,12 @@ rather than `u32` is exactly the kind of thing this rule exists to keep visible.
 
 ### index / count / size
 
-HPACK's static table is **1-based** (entry 1 is `:authority`), and the dynamic
-table indexes continue from 62 in reverse insertion order. zoxy's rule that
-`index`, `count` and `size` are distinct types that must be cast explicitly is
-load-bearing here, not hygiene.
+zoxy's rule that `index`, `count` and `size` are distinct types that must be
+cast explicitly still applies, though its sharpest instance went to hpack with
+the tables — HPACK's static table is 1-based and its dynamic table continues
+from 62 in reverse insertion order. What is left here is quieter and no less
+able to bite: a frame's `length` counts payload octets, a stream identifier
+counts nothing, and `BlockAssembler` carries both at once.
 
 ## What does not apply
 
@@ -78,9 +81,9 @@ here would push each consumer's control flow into the library.
 
 zoxy: "for a proxy the slow resource is the **network**, then syscalls/memory
 bandwidth." There is no network in this package. The slow resources are **CPU and
-memory bandwidth**: Huffman decode, table lookup, and the per-field scan of a
-header block. "Batch to amortize syscall costs" becomes "amortize per-field costs
-across a whole header block".
+memory bandwidth**: the nine-octet header parse, and the vectorised octet scan
+the field validators run over every name and value. "Batch to amortize syscall
+costs" becomes "amortize per-field costs across a whole header block".
 
 The back-of-the-envelope discipline still applies, against those resources.
 
@@ -94,9 +97,10 @@ disagree:
 - **zoxy** wants them on in production. It is the security boundary, and it
   points this decoder at the open internet.
 - **zrk** is a latency-measuring tool whose entire pitch is not injecting
-  client-side noise into the measurement. HPACK decode is already new hot-path
-  cost there (h2 makes header decoding mandatory where HTTP/1.1 was a scan for
-  CRLF), and it points this decoder at servers it chose to benchmark.
+  client-side noise into the measurement. Header decoding is already new
+  hot-path cost there (h2 makes it mandatory where HTTP/1.1 was a scan for
+  CRLF), and it points this decoder at servers it chose to benchmark. The
+  option is forwarded to hpack, which is where that cost actually lands.
 
 Resolution: `-Dassertions`, **defaulting to on**. zoxy inherits the default and
 states nothing; zrk opts out explicitly, in a line a reviewer can see, having
@@ -129,12 +133,13 @@ threat model and a bug.
 
 ## What zoxy's file does not cover, and this package needs
 
-- **Fuzz targets are a gate, not a nicety.** The HPACK decoder and the frame
-  parser each get a `std.testing.fuzz` target asserting reject-or-parse with no
-  third outcome. zoxy's "let a deterministic simulator be the last line of
-  defense" has no simulator to point at for a pure codec; fuzzing is the
-  equivalent.
-- **RFC 7541 §C test vectors** ship as fixtures and run in CI.
+- **Fuzz targets are a gate, not a nicety.** The frame parser and the field
+  validators each get a `std.testing.fuzz` target asserting reject-or-parse with
+  no third outcome; HPACK's equivalents went to hpack with the code they cover.
+  zoxy's "let a deterministic simulator be the last line of defense" has no
+  simulator to point at for a pure codec; fuzzing is the equivalent.
+- **RFC 9113's own examples** ship as fixtures and run in CI; RFC 7541
+  Appendix C went to hpack with the code it tests.
 - **The `zig build lint` unbounded-loop check** lives in zoxy's `scripts/`. It
   is ported here, or the no-unbounded-`while (true)` rule is unenforced —
   in the one package where that rule matters most.

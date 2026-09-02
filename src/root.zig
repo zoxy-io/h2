@@ -1,5 +1,8 @@
-//! h2 — HTTP/2 frame codec (RFC 9113 sections 4-6), HPACK (RFC 7541), and the
-//! message-level rules of RFC 9113 section 8.
+//! h2 — HTTP/2 frame codec (RFC 9113 sections 4-6) and the message-level rules
+//! of RFC 9113 section 8.
+//!
+//! HPACK is RFC 7541 and lives in zoxy-io/hpack; `hpack` below re-exports it,
+//! and the doc comment there says why.
 //!
 //! Bytes in, frames and header fields out. Nothing here reads a socket or
 //! holds connection state: the two consumers do not share a runtime, so
