@@ -6,129 +6,155 @@
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/zoxy-io/h2/test-x86_64-windows.yml?label=x86_64-windows)
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/zoxy-io/h2/test-macos.yml?label=macos)
 
-HTTP/2 frame codec and field validation.
+HTTP/2 frame codec and message validation for Zig 0.16.
 
-## Scope
+h2 parses and renders the ten HTTP/2 frame types, reassembles field blocks
+split across CONTINUATION frames, and checks that a decoded field section is
+a well-formed request or response under RFC 9113 §8. HPACK is provided by
+[hpack](https://github.com/zoxy-io/hpack) and re-exported as `h2.hpack`.
 
-* **RFC 9113 frame codec** — framing only, not the connection state machine.
-* **RFC 9113 §8.2 and §8.3 message validation** — the octet rules for field
-  names and values, and the pseudo-header rules that make a request or response
-  well-formed. Between them they are the guard against request smuggling
-  through an HTTP/1.1 downgrade. A check, never an enforcement: what to do
-  about a malformed message is the consumer's decision, and the two consumers
-  answer differently.
+It is a codec, not a connection. Stream state, flow control, SETTINGS
+negotiation, sockets and TLS are the caller's. The library never allocates,
+never copies where a slice will do, and never reads from a socket: bytes in,
+frames and fields out.
 
-Out of scope, permanently: sockets, TLS, ALPN, flow control policy, stream
-scheduling, and the connection state machine. Those differ per consumer and
-stay in the consumer.
+## What is implemented
 
-**HPACK is not on that list and is not in this package**, though it is still
-reachable as `h2.hpack`. RFC 7541 lives in
-[zoxy-io/hpack](https://github.com/zoxy-io/hpack), because RFC 9204 adopts two
-of its pieces verbatim — the prefixed integer and the Huffman code — so
-[zoxy-io/h3](https://github.com/zoxy-io/h3) builds against exactly those, and
-the alternative was a second copy of a 900-line vectorised Huffman decoder in
-the same organisation. This package re-exports it unchanged, because HPACK is
-part of what speaking HTTP/2 requires and `h2.hpack.Decoder` is the spelling
-both consumers already write. A compression bug, its fuzz targets and its
-benchmark rows belong there rather than here.
+| Area | Coverage |
+|---|---|
+| [RFC 9113](https://www.rfc-editor.org/rfc/rfc9113) §4–§6 frames | The nine-octet header, all ten frame types with padding and priority fields, SETTINGS as an iterator over entries, render and parse in both directions |
+| RFC 9113 §7 errors | Every parse or validation error maps to an RFC error code and a severity, so the caller knows whether to reset the stream or close the connection |
+| RFC 9113 §6.2, §6.10 CONTINUATION | `BlockAssembler` joins a field block across frames into a caller-owned buffer whose length bounds the block. It rejects interleaved frames and caps the frame count |
+| RFC 9113 §8.2, §8.3 messages | Field name and value octet rules, pseudo-header ordering, presence and uniqueness, connection-specific fields, `TE`, CONNECT, and RFC 9110 `content-length` syntax and agreement. Requests, responses and trailers |
+| [RFC 7541](https://www.rfc-editor.org/rfc/rfc7541) HPACK | Via `h2.hpack`: encoder, decoder, dynamic table, Huffman coding |
 
-## Properties
+Every frame type is checked against the
+[http2jp/http2-frame-test-case](https://github.com/http2jp/http2-frame-test-case)
+fixtures vendored under `corpus/`, including the 22 error cases.
 
-* Never allocates — no `std.mem.Allocator` in the public API.
-* Never copies where a slice will do.
-* Caller-owned, caller-sized buffers — including `BlockAssembler`'s, whose
-  length *is* the bound on a field block and therefore the CONTINUATION-flood
-  defence.
-* One dependency, [hpack](https://github.com/zoxy-io/hpack), which has none of
-  its own. The rule is **no dependency outside the organisation, and none that
-  pulls in a runtime or a libcrypto**; `zig build lint` still forbids
-  `@cImport`.
-* Assertions ship by default, in every optimize mode. Roughly 350 of them, and
-  several are the only check on an arithmetic relation. `-Dassertions=false`
-  removes them for a consumer that has made that argument — see
-  [`src/assert.zig`](src/assert.zig) for why this is not `std.debug.assert`.
-* Bytes in, frames and header fields out — no reader, writer or `std.Io` in the
-  seam. Its two consumers, [zoxy](https://github.com/zoxy-io/zoxy) (reverse
-  proxy, libxev completion callbacks) and
-  [zrk](https://github.com/zoxy-io/zrk) (load generator, zio green threads
-  through `std.Io`), do not share a runtime, so a reader in a signature would
-  exclude one of them. `zig build lint` enforces it.
+## Installation
+
+```sh
+zig fetch --save git+https://github.com/zoxy-io/h2
+```
+
+```zig
+// build.zig
+const h2 = b.dependency("h2", .{
+    .target = target,
+    .optimize = optimize,
+    // Optional. Assertions are on in every optimize mode unless disabled here.
+    // .assertions = false,
+});
+exe.root_module.addImport("h2", h2.module("h2"));
+```
+
+h2 depends on [hpack](https://github.com/zoxy-io/hpack) and nothing else.
 
 ## Usage
 
-The receive path, end to end — a frame header, its payload, a field block spread
-across CONTINUATION frames, HPACK (through the re-export), and the RFC 9113 §8
-rules that decide whether the result is a message at all:
+Receiving: parse the header, slice the payload, feed it to the assembler,
+and decode the completed block one field at a time through HPACK and the
+message validator.
 
 ```zig
 const h2 = @import("h2");
 
-var assembler: h2.frame.BlockAssembler = .init(&block_buffer, 16);
+var assembler: h2.frame.BlockAssembler = .init(&block_buffer, h2.frame.BlockAssembler.frames_max_default);
 var decoder: h2.hpack.Decoder = .init(hpack_storage.table(), list_size_max);
 
-// 1. The nine octets, and everything they can decide on their own.
-const header = try h2.frame.Header.parse(wire[offset..]);
-try header.validate(max_frame_size);
+var offset: usize = 0;
+while (offset < wire.len) {
+    const header = try h2.frame.Header.parse(wire[offset..]);
+    try header.validate(max_frame_size);
+    offset += h2.frame.Header.octets;
 
-// 2. The payload, sliced by the length the header declared.
-const payload = try h2.frame.payload.parse(header, body);
+    const body = wire[offset..][0..header.length];
+    offset += header.length;
+    const payload = try h2.frame.payload.parse(header, body);
 
-// 3. The CONTINUATION state machine: was this frame allowed to arrive?
-const block = switch (try assembler.accept(header, &payload)) {
-    .passthrough, .fragment => continue,
-    .block => |complete| complete,
-};
+    const block = switch (try assembler.accept(header, &payload)) {
+        .passthrough, .fragment => continue, // a non-HEADERS frame, or more to come
+        .block => |complete| complete,
+    };
 
-// 4. HPACK and the §8 rules, in one pass. The decoder is an iterator and the
-//    validator is fed one field at a time, because a field's slices borrow
-//    from `field_buffer` and the next field may reuse it.
-var validator: h2.fields.MessageValidator = .init(.{ .kind = .request, .rules = .strict });
-var iterator = decoder.iterate(&field_buffer, block.fragment);
-while (try iterator.next()) |field| {
-    try validator.field(&field);
-    // ... field.name, field.value
+    var validator: h2.fields.MessageValidator = .init(.{ .kind = .request, .rules = .strict });
+    var iterator = decoder.iterate(&field_buffer, block.fragment);
+    while (try iterator.next()) |field| {
+        try validator.field(&field);
+        // field.name, field.value borrow from field_buffer until the next call
+    }
+    try validator.finish();
 }
-try validator.finish();
 ```
 
-[`example/receive.zig`](example/receive.zig) is the whole thing, including the
-send path that produces the octets it reads back. It is a compiled, run program
-rather than a snippet — `zig build example`, and `zig build ci` runs it — so a
-usage example that stopped building fails the build instead of greeting the next
-reader.
+Sending: encode the fields with HPACK, then render a frame header in front
+of each fragment.
 
-Nothing above allocates. Every buffer is caller-owned and caller-sized, and
-every size traces to a setting or an RFC clause: `block_buffer`'s length *is*
-the bound on a field block, which is what stops the CONTINUATION flood.
+```zig
+var storage: h2.hpack.Encoder.Storage(4096) = .{};
+var encoder = storage.encoder(.dynamic);
 
-## Gates
+var block: [256]u8 = undefined;
+const encoded = encoder.encode(&block, &.{
+    .{ .name = ":method", .value = "GET" },
+    .{ .name = ":scheme", .value = "https" },
+    .{ .name = ":authority", .value = "www.example.com" },
+    .{ .name = ":path", .value = "/" },
+});
+
+const header: h2.frame.Header = .{
+    .length = @intCast(encoded.written),
+    .frame_type = .headers,
+    .flags = h2.frame.Flag.end_headers.bit() | h2.frame.Flag.end_stream.bit(),
+    .stream_identifier = 1,
+};
+const header_octets = try header.render(&wire);
+@memcpy(wire[header_octets..][0..encoded.written], block[0..encoded.written]);
+```
+
+Both paths are taken from [`example/receive.zig`](example/receive.zig),
+which builds a request split across a CONTINUATION frame and reads it back.
+It is compiled and run as part of `zig build ci`.
+
+Sizing is the caller's: the block buffer's length is the limit on a field
+block and therefore the defence against a CONTINUATION flood, and the HPACK
+storage size is the `SETTINGS_HEADER_TABLE_SIZE` you advertise.
+
+## Design constraints
+
+- **No allocator.** `std.mem.Allocator` does not appear in the public API or
+  under `src/`. Every buffer is caller-owned and caller-sized.
+- **No I/O.** No `std.Io`, `std.posix`, `std.net` or `std.fs` under `src/`.
+  The build's lint step enforces this.
+- **No connection state.** Flow control, stream states and SETTINGS
+  negotiation are policy and differ between a proxy and a client, so they
+  stay with the caller. Validation reports; it does not decide what to do
+  about a malformed message.
+- **Assertions are a build option.** On by default in every optimize mode,
+  removed with `-Dassertions=false`. See [`src/assert.zig`](src/assert.zig).
+
+## Building and testing
 
 ```sh
-zig build ci      # format check, tests, fuzz corpus, interop corpus, boundary lint
-zig build ci -Doptimize=ReleaseFast                     # zoxy's build
-zig build ci -Doptimize=ReleaseFast -Dassertions=false  # zrk's build
-zig build bench   # decode/encode microbenchmarks (ReleaseFast)
-zig build fuzz    # replay the fuzz corpus; --fuzz to actually fuzz
-zig build corpus  # vendored HTTP/2 frame fixtures
-zig build fmt-fix # reformat in place
-zig build example # build and run the usage example above
+zig build ci                                             # fmt, unit tests, fuzz corpus, frame corpus, example, lint
+zig build ci -Doptimize=ReleaseFast                      # release, assertions on
+zig build ci -Doptimize=ReleaseFast -Dassertions=false   # release, assertions off
+zig build fuzz --fuzz                                    # coverage-guided fuzzing
+zig build bench                                          # decode and encode microbenchmarks
+zig build fmt-fix                                        # reformat
 ```
 
-CI runs `zig build ci` natively on each target, so the tests run rather than
-merely cross-compile, and runs all three rows above. The release rows are not
-redundant: `-Dassertions=false` in Debug removes the `if (!ok)` and nothing
-else, so only a release mode tests that the checks are actually gone — and only
-a release mode reaches the undefined behaviour that a `catch unreachable`
-guarded by a removed assertion becomes.
+CI runs the three `ci` invocations above on x86_64 and aarch64 Linux,
+Windows and macOS.
 
-## Style
+## Documentation
 
-[`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md) — zoxy's TigerStyle, plus the
-deltas a shared library forces. [`CLAUDE.md`](CLAUDE.md) carries the same rules
-as working instructions, including the review and benchmark gates.
+- [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md): the coding rules the lint and
+  the review enforce.
+- [corpus/README.md](corpus/README.md): the vendored frame fixtures and what
+  they cover.
 
-## Context
+## License
 
-* zoxy-io/zoxy#173 — HTTP/2 support in the proxy (slices #272 HPACK, #273 frame codec).
-* zoxy-io/zrk#21 — HTTP/2 support in the load generator.
+[MIT](LICENSE)
