@@ -20,7 +20,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.1
 
       # `ci` is fmt + test + lint. Running the whole step rather than
       # `zig build test` keeps CI and a local check from checking different

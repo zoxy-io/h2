@@ -6,7 +6,7 @@
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/zoxy-io/h2/test-x86_64-windows.yml?label=x86_64-windows)
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/zoxy-io/h2/test-macos.yml?label=macos)
 
-HTTP/2 frame codec and message validation for Zig 0.16.
+HTTP/2 frame codec and message validation for Zig 0.17.
 
 h2 parses and renders the ten HTTP/2 frame types, reassembles field blocks
 split across CONTINUATION frames, and checks that a decoded field section is

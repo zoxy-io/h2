@@ -215,7 +215,7 @@ pub const Settings = struct {
         const at = index * settings_entry_octets;
         const octets = settings.entries[at..][0..settings_entry_octets];
         return .{
-            .identifier = @enumFromInt((@as(u16, octets[0]) << 8) | octets[1]),
+            .identifier = @fromBackingInt((@as(u16, octets[0]) << 8) | octets[1]),
             .value = (@as(u32, octets[2]) << 24) | (@as(u32, octets[3]) << 16) |
                 (@as(u32, octets[4]) << 8) | octets[5],
         };
@@ -283,7 +283,7 @@ pub fn parse(header: Header, payload: []const u8) Error!Payload {
         .rst_stream => blk: {
             assert(payload.len == error_code_octets);
             break :blk .{ .rst_stream = .{
-                .error_code = @enumFromInt(readU32(payload[0..error_code_octets])),
+                .error_code = @fromBackingInt(readU32(payload[0..error_code_octets])),
             } };
         },
         .settings => blk: {
@@ -299,7 +299,7 @@ pub fn parse(header: Header, payload: []const u8) Error!Payload {
             assert(payload.len >= stream_identifier_octets + error_code_octets);
             break :blk .{ .goaway = .{
                 .last_stream_identifier = readStreamIdentifier(payload[0..stream_identifier_octets]),
-                .error_code = @enumFromInt(readU32(payload[stream_identifier_octets..][0..error_code_octets])),
+                .error_code = @fromBackingInt(readU32(payload[stream_identifier_octets..][0..error_code_octets])),
                 .debug_data = payload[stream_identifier_octets + error_code_octets ..],
             } };
         },
@@ -602,7 +602,7 @@ fn renderPayload(payload: *const Payload, target: []u8) void {
             writePadded(target, headers.fragment, headers.padding, prefix);
         },
         .priority => |priority| writePriority(target[0..priority_fields_octets], priority),
-        .rst_stream => |rst| writeU32(target[0..error_code_octets], @intFromEnum(rst.error_code)),
+        .rst_stream => |rst| writeU32(target[0..error_code_octets], @backingInt(rst.error_code)),
         .settings => |settings| @memcpy(target, settings.entries),
         .push_promise => |promise| {
             var fixed: [stream_identifier_octets]u8 = undefined;
@@ -614,7 +614,7 @@ fn renderPayload(payload: *const Payload, target: []u8) void {
             writeU32(target[0..stream_identifier_octets], goaway.last_stream_identifier);
             writeU32(
                 target[stream_identifier_octets..][0..error_code_octets],
-                @intFromEnum(goaway.error_code),
+                @backingInt(goaway.error_code),
             );
             @memcpy(target[stream_identifier_octets + error_code_octets ..], goaway.debug_data);
         },
@@ -801,7 +801,7 @@ test "SETTINGS iterates its parameters and keeps unknown identifiers" {
     // Section 6.5.2 says a receiver ignores an unknown identifier; ignoring is
     // the consumer's to do, so it arrives rather than disappearing.
     const second = iterator.next().?;
-    try testing.expectEqual(@as(u16, 0xffff), @intFromEnum(second.identifier));
+    try testing.expectEqual(@as(u16, 0xffff), @backingInt(second.identifier));
     try testing.expectEqual(@as(u32, 7), second.value);
     try testing.expectEqual(@as(?Settings.Entry, null), iterator.next());
 }
@@ -898,8 +898,8 @@ test "every payload shape survives a render and parse round trip" {
 
         const again = try parse(header, target[Header.octets..][0..header.length]);
         try testing.expectEqual(
-            @intFromEnum(std.meta.activeTag(case.payload)),
-            @intFromEnum(std.meta.activeTag(again)),
+            @backingInt(std.meta.activeTag(case.payload)),
+            @backingInt(std.meta.activeTag(again)),
         );
         // And rendering what came back reproduces the same octets.
         var second: [128]u8 = undefined;
