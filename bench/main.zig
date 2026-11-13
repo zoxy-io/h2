@@ -119,7 +119,7 @@ fn benchFrameHeader(iterations: u64) u64 {
             const verdict: u64 = if (header.validate(h2.frame.Header.max_frame_size_min))
                 0
             else |err|
-                @intFromEnum(h2.frame.Header.errorCode(err));
+                @backingInt(h2.frame.Header.errorCode(err));
             var rendered: [h2.frame.Header.octets]u8 = undefined;
             _ = h2.frame.Header.render(header, &rendered) catch unreachable;
             checksum +%= header.length +% rendered[0] +% verdict;
@@ -148,7 +148,7 @@ fn benchFrameParse(iterations: u64) u64 {
                 .data => |data| data.data.len,
                 .headers => |headers| headers.fragment.len,
                 .priority => |priority| priority.weight(),
-                .rst_stream => |rst| @intFromEnum(rst.error_code),
+                .rst_stream => |rst| @backingInt(rst.error_code),
                 .settings => |settings| settings.count(),
                 .push_promise => |promise| promise.promised_stream_identifier,
                 .ping => |ping| ping.opaque_data[0],
@@ -562,7 +562,7 @@ fn report(results: []const Result, iterations: u64) void {
     std.debug.print("\n{s:<24} {s:>12} {s:>12} {s:>12} {s:>12}\n", .{
         "workload", "min", "mean", "max", "ns/op",
     });
-    std.debug.print("{s}\n", .{"-" ** 77});
+    std.debug.print("{s}\n", .{&@as([77]u8, @splat('-'))});
     for (results) |result| {
         assert(result.min_ns <= result.max_ns);
         std.debug.print("{s:<24} {d:>11.3}s {d:>11.3}s {d:>11.3}s {d:>12.3}\n", .{

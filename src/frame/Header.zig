@@ -217,7 +217,7 @@ pub fn parse(source: []const u8) ParseError!Header {
         (@as(u32, source[7]) << 8) | source[8];
     const header: Header = .{
         .length = (@as(u24, source[0]) << 16) | (@as(u24, source[1]) << 8) | source[2],
-        .frame_type = @enumFromInt(source[3]),
+        .frame_type = @fromBackingInt(source[3]),
         .flags = source[4],
         .stream_identifier = @intCast(raw_stream & stream_identifier_mask),
     };
@@ -240,7 +240,7 @@ pub fn render(header: Header, target: []u8) RenderError!u32 {
     target[0] = @truncate(header.length >> 16);
     target[1] = @truncate(header.length >> 8);
     target[2] = @truncate(header.length);
-    target[3] = @intFromEnum(header.frame_type);
+    target[3] = @backingInt(header.frame_type);
     target[4] = header.flags;
     // The reserved bit goes out as zero, which section 4.1 requires of a
     // sender even though a receiver must not care.
@@ -514,7 +514,7 @@ test "an unknown type carries no length or stream rule" {
     // Section 4.1: ignored, which means no rule can fail on it.
     const header: Header = .{
         .length = 1234,
-        .frame_type = @enumFromInt(0xfa),
+        .frame_type = @fromBackingInt(0xfa),
         .flags = 0xff,
         .stream_identifier = 0,
     };
@@ -523,7 +523,7 @@ test "an unknown type carries no length or stream rule" {
 
     const on_a_stream: Header = .{
         .length = 1234,
-        .frame_type = @enumFromInt(0xfa),
+        .frame_type = @fromBackingInt(0xfa),
         .flags = 0xff,
         .stream_identifier = 7,
     };
@@ -539,7 +539,7 @@ test "every defined type is known and every undefined one is not" {
 
     var raw: u16 = 0x0a;
     while (raw <= 0xff) : (raw += 1) {
-        try testing.expect(!@as(Type, @enumFromInt(@as(u8, @intCast(raw)))).known());
+        try testing.expect(!@as(Type, @fromBackingInt(@as(u8, @intCast(raw)))).known());
     }
 }
 
@@ -689,8 +689,8 @@ test "flags are read through the type that defines them" {
 test "error codes map to what a peer is sent" {
     try testing.expectEqual(ErrorCode.protocol_error, errorCode(error.Protocol));
     try testing.expectEqual(ErrorCode.frame_size_error, errorCode(error.FrameSize));
-    try testing.expectEqual(@as(u32, 0x01), @intFromEnum(ErrorCode.protocol_error));
-    try testing.expectEqual(@as(u32, 0x06), @intFromEnum(ErrorCode.frame_size_error));
+    try testing.expectEqual(@as(u32, 0x01), @backingInt(ErrorCode.protocol_error));
+    try testing.expectEqual(@as(u32, 0x06), @backingInt(ErrorCode.frame_size_error));
 }
 
 test "a wrong-length PRIORITY frame is the one stream error, and the rest are not" {
@@ -731,8 +731,8 @@ test "anything on stream zero, and every stream-rule failure, ends the connectio
     try testing.expectEqual(Severity.connection, data_on_zero.severity(error.Protocol));
 
     // An unknown type is section 4.2's general rule, both ways.
-    const unknown_stream: Header = .{ .length = 1, .frame_type = @enumFromInt(0xfa), .flags = 0, .stream_identifier = 1 };
+    const unknown_stream: Header = .{ .length = 1, .frame_type = @fromBackingInt(0xfa), .flags = 0, .stream_identifier = 1 };
     try testing.expectEqual(Severity.stream, unknown_stream.severity(error.FrameSize));
-    const unknown_zero: Header = .{ .length = 1, .frame_type = @enumFromInt(0xfa), .flags = 0, .stream_identifier = 0 };
+    const unknown_zero: Header = .{ .length = 1, .frame_type = @fromBackingInt(0xfa), .flags = 0, .stream_identifier = 0 };
     try testing.expectEqual(Severity.connection, unknown_zero.severity(error.FrameSize));
 }

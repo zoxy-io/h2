@@ -89,7 +89,7 @@ fn fuzzFrameHeader(_: void, smith: *std.testing.Smith) !void {
         // else it says.
         assert(header.length <= max_frame_size);
     } else |err| {
-        const code = @intFromEnum(frame.Header.errorCode(err));
+        const code = @backingInt(frame.Header.errorCode(err));
         assert(code == 0x01 or code == 0x06);
         // Severity is decidable for every failure, and a stream error needs a
         // stream: nothing on stream zero may be answered with RST_STREAM.
@@ -439,7 +439,7 @@ fn expectWellFormed(
     options: h2.fields.MessageValidator.Options,
     block: []const h2.hpack.Field,
 ) !void {
-    var seen = [_]bool{false} ** oracle_pseudo.len;
+    var seen: [oracle_pseudo.len]bool = @splat(false);
     var regular_seen = false;
     var connect = false;
     var http_scheme = false;

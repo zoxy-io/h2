@@ -287,8 +287,8 @@ comptime {
     // or a single item, so a struct with no pointer and no optional field has
     // nothing a caller's buffer reuse could invalidate — and adding one later
     // fails the build here instead of failing in a proxy.
-    for (@typeInfo(MessageValidator).@"struct".fields) |struct_field| {
-        const kind = @typeInfo(struct_field.type);
+    for (@typeInfo(MessageValidator).@"struct".field_types) |field_type| {
+        const kind = @typeInfo(field_type);
         assert(kind != .pointer);
         assert(kind != .optional);
     }
@@ -299,7 +299,7 @@ pub fn init(options: Options) MessageValidator {
         .kind = options.kind,
         .rules = options.rules,
         .extended_connect = options.extended_connect,
-        .seen = .initEmpty(),
+        .seen = .empty,
         .regular_seen = false,
         .method_is_connect = false,
         .scheme_is_http = false,

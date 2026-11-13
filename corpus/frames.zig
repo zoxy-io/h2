@@ -132,7 +132,7 @@ test "every fixture's declared frame agrees with its own octets" {
             std.debug.print("{s}/{s}: codec length\n", .{ fixture.category, fixture.name });
             return err;
         };
-        try std.testing.expectEqual(header.frame_type, @intFromEnum(decoded.frame_type));
+        try std.testing.expectEqual(header.frame_type, @backingInt(decoded.frame_type));
         try std.testing.expectEqual(header.flags, decoded.flags);
         std.testing.expectEqual(header.stream_identifier, @as(u32, decoded.stream_identifier)) catch |err| {
             std.debug.print("{s}/{s}: codec stream identifier\n", .{ fixture.category, fixture.name });
@@ -218,11 +218,11 @@ test "no valid fixture is rejected, and every rejection is one the fixture allow
 
         const got: ?u32 = blk: {
             header.validate(max_frame_size) catch |err| {
-                break :blk @intFromEnum(frame.Header.errorCode(err));
+                break :blk @backingInt(frame.Header.errorCode(err));
             };
             const body = wire[frame.Header.octets..][0..header.length];
             _ = frame.payload.parse(header, body) catch |err| {
-                break :blk @intFromEnum(frame.payload.errorCode(err));
+                break :blk @backingInt(frame.payload.errorCode(err));
             };
             break :blk null;
         };
@@ -314,7 +314,7 @@ fn checkPayload(want: *const std.json.ObjectMap, got: *const frame.Payload) !voi
         .rst_stream => |rst| {
             try std.testing.expectEqual(
                 @as(u32, @intCast(want.get("error_code").?.integer)),
-                @intFromEnum(rst.error_code),
+                @backingInt(rst.error_code),
             );
         },
         .settings => |settings| {
@@ -326,7 +326,7 @@ fn checkPayload(want: *const std.json.ObjectMap, got: *const frame.Payload) !voi
                 const decoded = iterator.next().?;
                 try std.testing.expectEqual(
                     @as(u16, @intCast(pair.items[0].integer)),
-                    @intFromEnum(decoded.identifier),
+                    @backingInt(decoded.identifier),
                 );
                 try std.testing.expectEqual(
                     @as(u32, @intCast(pair.items[1].integer)),
@@ -353,7 +353,7 @@ fn checkPayload(want: *const std.json.ObjectMap, got: *const frame.Payload) !voi
             );
             try std.testing.expectEqual(
                 @as(u32, @intCast(want.get("error_code").?.integer)),
-                @intFromEnum(goaway.error_code),
+                @backingInt(goaway.error_code),
             );
             try std.testing.expectEqualStrings(
                 want.get("additional_debug_data").?.string,

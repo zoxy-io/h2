@@ -1,7 +1,7 @@
 # h2
 
 HTTP/2 frame codec (RFC 9113 §4-§6) and the message rules of RFC 9113 §8, in
-Zig 0.16. **HPACK is not here** — RFC 7541 lives in
+Zig 0.17. **HPACK is not here** — RFC 7541 lives in
 [zoxy-io/hpack](https://github.com/zoxy-io/hpack) and is re-exported as
 `h2.hpack`, so a compression change belongs in that repository and under that
 repository's gates. A library, not a program: it is consumed by
